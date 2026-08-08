@@ -1,0 +1,12 @@
+# Swift Package Manager
+.build/
+
+# Assembled application bundle
+build/
+
+# Generated from the .ogg originals by tools/prepare_pack.sh.
+# Derived, large, and reproducible, so it is not tracked.
+SoundPacks/*/*.wav
+
+# macOS
+.DS_Store

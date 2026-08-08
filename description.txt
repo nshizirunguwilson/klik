@@ -1,0 +1,50 @@
+Klik
+
+One line: A macOS menu bar app that gives any keyboard the sound of a mechanical one.
+
+Short description:
+Klik is a lightweight native macOS utility that plays real mechanical keyboard switch sounds as you type. It runs in the menu bar, works with any keyboard including the built-in MacBook one, and adds no perceptible delay between the keypress and the sound. Sounds are loaded from swappable sound packs, so you can switch between switch types (Cherry MX, Everglide Oreo, NovelKeys Cream) or record and load your own. Everything runs offline, nothing is logged, nothing leaves the machine.
+
+Longer framing, if you need it for a portfolio or README:
+
+Klik came out of a simple annoyance: mechanical keyboards sound great but are loud, expensive, and impractical to carry around. The software version gets you the audio feedback without the hardware.
+
+The interesting problem is not the UI, it's latency. Anything above roughly 20ms between keypress and sound and your brain stops accepting it as the keyboard's own sound. Getting under that means every sample is decoded into memory at launch, key events are read straight from the system event tap rather than through the app framework, and the audio graph is built once and never touched again while running. On top of that, per-keystroke pitch and gain randomisation is what stops a small sample set from sounding like a loop.
+
+Klik reads a swappable sound pack format compatible with the existing Mechvibes community packs, so it inherits a large library of switch recordings rather than needing its own.
+
+Tools and stack
+
+Language and frameworks
+
+Swift 5.9+, the whole app
+SwiftUI for the menu bar interface (MenuBarExtra)
+AVFoundation / AVAudioEngine for playback
+CoreGraphics CGEvent API for global key capture
+ApplicationServices for the Accessibility permission check
+
+Development
+
+Xcode 15+ (required, no way around it for a native Mac app)
+macOS 14 Sonoma or later as the deployment target
+Git and GitHub for version control
+
+Audio work
+
+Audacity for slicing, trimming and normalising samples (free)
+ffmpeg for format conversion, install via Homebrew
+Python 3 with pydub for the batch pack converter script
+
+Design, if you want promo material
+
+Figma or Sketch for the icon and menu mockups
+SF Symbols for the menu bar glyph, it's Apple's own and free
+
+Optional later
+
+KeyboardShortcuts (Swift package by Sindre Sorhus) for a global mute hotkey, saves you writing Carbon code
+SMAppService from ServiceManagement for launch at login, built into macOS
+
+Costs: zero. Everything above is free, and you don't need an Apple Developer account since you're not distributing. You'll just self-sign locally.
+
+One flag on the name: Klik is a fairly common word and there are existing apps using it. Doesn't matter at all for personal use, but if you ever change your mind about shipping, do a quick App Store and trademark search first.

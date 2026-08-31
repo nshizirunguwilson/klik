@@ -67,8 +67,13 @@ enum DeviceTest {
                 }
             }
             let ok = peak > 0.001
-            print(String(format: "  %-40s peak %.4f  %@",
-                         (label as NSString).utf8String!, peak, ok ? "sound" : "SILENT"))
+            print(String(format: "  %-40s peak %.4f  %@   [running=%@ settled=%@ pinned=%@ dev=%@]",
+                         (label as NSString).utf8String!, peak, ok ? "sound" : "SILENT",
+                         engine.isRunning ? "y" : "n",
+                         engine.isSettled ? "y" : "n",
+                         engine.isUsingBuiltInOutput ? "y" : "n",
+                         engine.currentOutputDeviceName))
+            print("        voices playing: \(engine.playingVoiceCount)/24")
             if !ok { failures.append(label) }
         }
 
@@ -76,29 +81,41 @@ enum DeviceTest {
         check("at launch")
 
         setDefaultOutput(other)
-        settle()
+        settle(engine)
         check("after \(OutputDevices.name(of: other)) became default")
 
         // The pin is what the "always use built-in speakers" switch does, and it
         // is the step that used to kill the graph.
         engine.setBuiltInOutput(false)
-        settle()
+        settle(engine)
         check("following system output")
 
         engine.setBuiltInOutput(true)
-        settle()
+        settle(engine)
         check("pinned back to built-in speakers")
 
         setDefaultOutput(original)
-        settle()
+        settle(engine)
         check("after the device went away again")
 
         // Connecting and disconnecting in a hurry is the realistic case: a
         // Bluetooth device announces itself several times as it settles.
         for round in 1...3 {
             setDefaultOutput(round.isMultiple(of: 2) ? speakers : other)
-            settle(0.5)
+            settle(engine)
             check("connect and disconnect, round \(round)")
+        }
+
+        // If a forced restart brings the sound back, the engine was wedged in a
+        // state it could not notice; if not, something else is wrong.
+        if !failures.isEmpty {
+            print("\nrecovery probe:")
+            engine.setBuiltInOutput(false)
+            settle(engine)
+            check("forced restart, following system")
+            engine.setBuiltInOutput(true)
+            settle(engine)
+            check("forced restart, pinned again")
         }
 
         engine.shutdown()
@@ -112,11 +129,16 @@ enum DeviceTest {
     }
 
     /// Device changes are not instant, and a Bluetooth device is slower than
-    /// most. Give the system time to finish before asking for sound.
-    private static func settle(_ seconds: TimeInterval = 1.2) {
+    /// most. Waits for the change to land and for the engine to finish reacting,
+    /// so each measurement is of a settled engine rather than one mid-restart.
+    private static func settle(_ engine: AudioEngine, upTo seconds: TimeInterval = 4) {
         let deadline = Date().addingTimeInterval(seconds)
+        // A minimum wait, because the device change has not necessarily even
+        // been noticed yet when this is called.
+        let earliest = Date().addingTimeInterval(1.0)
         while Date() < deadline {
-            RunLoop.current.run(mode: .default, before: deadline)
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+            if Date() > earliest && engine.isSettled { return }
         }
     }
 

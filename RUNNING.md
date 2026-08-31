@@ -1,6 +1,7 @@
 # Running and maintaining Klik
 
 Everything about keeping Klik installed, updated and working on your Mac.
+[Artifact Link](https://claude.ai/code/artifact/493fff16-6327-4007-9b21-f0ac89d4149e)
 
 `README.md` covers what Klik is. `DOCUMENTATION.md` covers how it works inside.
 This file covers living with it.

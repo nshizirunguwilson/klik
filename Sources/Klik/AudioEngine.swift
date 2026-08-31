@@ -59,7 +59,12 @@ final class AudioEngine {
 
     private let state = OSAllocatedUnfairLock(initialState: PlaybackState())
 
+    /// Whether the engine is producing audio right now.
     private(set) var isRunning = false
+    /// Whether the voices have been attached. Separate from `isRunning` on
+    /// purpose: a failed restart leaves the graph built but not running, and
+    /// recovery has to stay possible from there.
+    private var hasBuiltGraph = false
     /// Frames per render cycle actually granted by the output device.
     private(set) var ioBufferFrames: UInt32 = 0
     /// What each device's buffer was set to before Klik touched it, so the
@@ -75,7 +80,7 @@ final class AudioEngine {
     // MARK: - Lifecycle
 
     func start(lowLatencyBuffer: Bool, builtInOutput: Bool) {
-        guard !isRunning else { return }
+        guard !hasBuiltGraph else { return }
 
         lowLatencyEnabled = lowLatencyBuffer
         forceBuiltInOutput = builtInOutput
@@ -90,6 +95,7 @@ final class AudioEngine {
             players.append(player)
             varispeeds.append(varispeed)
         }
+        hasBuiltGraph = true
         connectGraph()
 
         NotificationCenter.default.addObserver(
@@ -143,7 +149,7 @@ final class AudioEngine {
     /// built-in speakers, which is exactly the moment that matters.
     @objc private func handleConfigurationChange() {
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.isRunning else { return }
+            guard let self, self.hasBuiltGraph else { return }
             self.restart(reason: "output device changed")
         }
     }
@@ -157,6 +163,7 @@ final class AudioEngine {
             engine.prepare()
             try engine.start()
             players.forEach { $0.play() }
+            isRunning = true
             log.notice("Restarted (\(reason, privacy: .public)), built-in: \(self.isUsingBuiltInOutput), IO buffer \(self.ioBufferFrames) frames")
         } catch {
             isRunning = false
@@ -198,7 +205,7 @@ final class AudioEngine {
     }
 
     func setBuiltInOutput(_ enabled: Bool) {
-        guard isRunning, enabled != forceBuiltInOutput else {
+        guard hasBuiltGraph, enabled != forceBuiltInOutput else {
             forceBuiltInOutput = enabled
             return
         }
@@ -213,14 +220,14 @@ final class AudioEngine {
     /// which is why the setting can be a live toggle rather than a relaunch.
     func setLowLatency(_ enabled: Bool) {
         lowLatencyEnabled = enabled
-        guard isRunning else { return }
+        guard hasBuiltGraph else { return }
         restart(reason: enabled ? "low latency on" : "low latency off")
     }
 
     /// Puts the device's buffer size back on the way out, so quitting Klik does
     /// not leave the setting changed for everything else.
     func shutdown() {
-        guard isRunning else { return }
+        guard hasBuiltGraph else { return }
         players.forEach { $0.stop() }
         engine.stop()
         for (device, frames) in originalIOBufferFrames {

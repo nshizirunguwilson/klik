@@ -40,6 +40,7 @@ cp Resources/AppIcon.icns "$CONTENTS/Resources/AppIcon.icns"
 
 if [[ -d SoundPacks ]]; then
   mkdir -p "$CONTENTS/Resources/SoundPacks"
+  MISSING_AUDIO=()
   # Only the pack files the app actually reads -- the .ogg originals stay in the
   # source tree, since AVAudioFile cannot decode them anyway.
   for pack in SoundPacks/*/; do
@@ -49,7 +50,23 @@ if [[ -d SoundPacks ]]; then
     cp "$pack/config.json" "$CONTENTS/Resources/SoundPacks/$name/"
     find "$pack" -maxdepth 1 \( -name '*.wav' -o -name '*.mp3' -o -name '*.m4a' -o -name '*.aiff' -o -name '*.caf' \) \
       -exec cp {} "$CONTENTS/Resources/SoundPacks/$name/" \;
+
+    # The .wav files are not in git, because they are large and generated. A
+    # fresh checkout therefore has packs with an .ogg the app cannot decode, and
+    # builds an app that runs perfectly and makes no sound at all. Say so here
+    # rather than letting that be discovered by typing.
+    if ! compgen -G "$CONTENTS/Resources/SoundPacks/$name/*" | grep -qv 'config\.json'; then
+      MISSING_AUDIO+=("$name")
+    fi
   done
+
+  if [[ ${#MISSING_AUDIO[@]} -gt 0 ]]; then
+    echo
+    echo "WARNING: these packs have no playable audio, so they will be silent:"
+    printf '    %s\n' "${MISSING_AUDIO[@]}"
+    echo "  Fix with: tools/prepare_pack.sh SoundPacks/${MISSING_AUDIO[0]}"
+    echo
+  fi
 fi
 
 # Signing identity, best first.

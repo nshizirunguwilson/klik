@@ -77,6 +77,8 @@ final class AudioEngine {
     /// devices announce themselves several times over about a second as they
     /// settle, and restarting on each one stops the sound mid-play.
     private static let restartDelay: TimeInterval = 0.35
+    /// How many restarts in a row have failed, used to space out the retries.
+    private var failedRestarts = 0
 
     private var lowLatencyEnabled = true
     /// Pin playback to the laptop's own speakers regardless of where the rest of
@@ -219,10 +221,17 @@ final class AudioEngine {
             try engine.start()
             players.forEach { $0.play() }
             isRunning = true
+            failedRestarts = 0
             log.notice("Restarted (\(reason, privacy: .public)), built-in: \(self.isUsingBuiltInOutput), IO buffer \(self.ioBufferFrames) frames")
         } catch {
             isRunning = false
-            log.error("Restart failed: \(error.localizedDescription, privacy: .public)")
+            failedRestarts += 1
+            // A device that is still settling refuses to start, and a moment
+            // later it is ready. Backing off rather than giving up is the
+            // difference between sound returning on its own and never.
+            let wait = min(8, 0.25 * pow(2, Double(failedRestarts - 1)))
+            log.error("Restart failed (attempt \(self.failedRestarts)): \(error.localizedDescription, privacy: .public), retrying in \(wait)s")
+            scheduleRestart(reason: "retry after a failed restart", after: wait)
         }
     }
 

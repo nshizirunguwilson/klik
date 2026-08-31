@@ -31,7 +31,7 @@ hidden system copy, no background service registered somewhere you cannot see.
 
 It is one folder:
 
-```
+```text
 /Applications/Klik.app
 ```
 
@@ -72,7 +72,7 @@ actually running.
 
 ### What install does, step by step
 
-```
+```text
 1. Compiles the Swift source
 2. Assembles build/Klik.app with the icon and sound packs
 3. Signs it with your Apple Development certificate
@@ -235,7 +235,7 @@ Run this after any change to `AudioEngine.swift` or `OutputDevices.swift`.
 
 A healthy run ends with:
 
-```
+```text
 OK  sound survived every device change
 ```
 

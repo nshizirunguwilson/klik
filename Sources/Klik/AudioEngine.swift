@@ -34,9 +34,10 @@ private struct PlaybackState: @unchecked Sendable {
 ///
 ///  1. Every sample is decoded to PCM at load time and sliced into a ready-made
 ///     buffer per key. Nothing touches the disk or a decoder while typing.
-///  2. The node graph is built once at startup and never rewired. Player nodes
-///     are started immediately and left running -- an idle player renders
-///     silence, so a keystroke costs one `scheduleBuffer` call and nothing else.
+///  2. The node graph is built once and only rewired when the output device
+///     changes. Player nodes are started immediately and left running -- an idle
+///     player renders silence, so a keystroke costs one `scheduleBuffer` call
+///     and nothing else.
 ///  3. The hardware buffer is shrunk as far as the output device allows, which
 ///     is the single biggest remaining term.
 final class AudioEngine {
@@ -86,11 +87,10 @@ final class AudioEngine {
             let varispeed = AVAudioUnitVarispeed()
             engine.attach(player)
             engine.attach(varispeed)
-            engine.connect(player, to: varispeed, format: Self.canonicalFormat)
-            engine.connect(varispeed, to: engine.mainMixerNode, format: Self.canonicalFormat)
             players.append(player)
             varispeeds.append(varispeed)
         }
+        connectGraph()
 
         NotificationCenter.default.addObserver(
             self,
@@ -112,6 +112,32 @@ final class AudioEngine {
         }
     }
 
+    /// Wires the voices into the mixer and the mixer into the output device.
+    ///
+    /// This has to be redone after every output device change, and that is the
+    /// whole reason the bug existed. Changing the device gives the output node a
+    /// new format, but the mixer is still connected to it through a connection
+    /// shaped for the device that just left. Nothing complains. The engine keeps
+    /// saying it is running, every voice keeps saying it is connected and
+    /// playing, and the mixer renders pure silence into the stale connection.
+    ///
+    /// Reconnecting is what makes the engine notice the new device at all.
+    private func connectGraph() {
+        // The mixer talks to the hardware in the hardware's own format and
+        // converts for us. The voices stay on the canonical format, which is
+        // what every pack was decoded into.
+        let hardware = engine.outputNode.outputFormat(forBus: 0)
+        let outputFormat = hardware.sampleRate > 0 && hardware.channelCount > 0
+            ? hardware
+            : Self.canonicalFormat
+        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: outputFormat)
+
+        for index in players.indices {
+            engine.connect(players[index], to: varispeeds[index], format: Self.canonicalFormat)
+            engine.connect(varispeeds[index], to: engine.mainMixerNode, format: Self.canonicalFormat)
+        }
+    }
+
     /// The engine stops itself when the output device changes -- headphones in,
     /// AirPods connecting, a display unplugged. Restarting also re-pins the
     /// built-in speakers, which is exactly the moment that matters.
@@ -126,6 +152,7 @@ final class AudioEngine {
         engine.stop()
         applyOutputDevice()
         applyIOBuffer()
+        connectGraph()
         do {
             engine.prepare()
             try engine.start()

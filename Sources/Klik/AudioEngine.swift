@@ -71,6 +71,13 @@ final class AudioEngine {
     /// setting can be put back rather than left changed for every other app.
     private var originalIOBufferFrames: [AudioDeviceID: UInt32] = [:]
 
+    /// A restart waiting for the device changes to stop arriving.
+    private var pendingRestart: DispatchWorkItem?
+    /// How long to wait for a burst of device changes to finish. Bluetooth
+    /// devices announce themselves several times over about a second as they
+    /// settle, and restarting on each one stops the sound mid-play.
+    private static let restartDelay: TimeInterval = 0.35
+
     private var lowLatencyEnabled = true
     /// Pin playback to the laptop's own speakers regardless of where the rest of
     /// the system's audio is going.
@@ -148,11 +155,28 @@ final class AudioEngine {
     /// AirPods connecting, a display unplugged. Restarting also re-pins the
     /// built-in speakers, which is exactly the moment that matters.
     @objc private func handleConfigurationChange() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.hasBuiltGraph else { return }
-            self.restart(reason: "output device changed")
-        }
+        scheduleRestart(reason: "output device changed")
     }
+
+    /// Queues a restart, replacing any restart already waiting.
+    ///
+    /// Connecting one pair of AirPods raises several changes in a row. Acting on
+    /// each one restarts the engine repeatedly, and a restart that lands while a
+    /// key is sounding cuts it off. Waiting for the changes to stop means one
+    /// restart per real event.
+    private func scheduleRestart(reason: String, after delay: TimeInterval? = nil) {
+        pendingRestart?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.hasBuiltGraph else { return }
+            self.pendingRestart = nil
+            self.restart(reason: reason)
+        }
+        pendingRestart = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (delay ?? Self.restartDelay), execute: work)
+    }
+
+    /// True once no restart is waiting and the engine is producing audio.
+    var isSettled: Bool { pendingRestart == nil && isRunning }
 
     private func restart(reason: String) {
         engine.stop()
@@ -238,6 +262,8 @@ final class AudioEngine {
     /// not leave the setting changed for everything else.
     func shutdown() {
         guard hasBuiltGraph else { return }
+        pendingRestart?.cancel()
+        pendingRestart = nil
         players.forEach { $0.stop() }
         engine.stop()
         for (device, frames) in originalIOBufferFrames {

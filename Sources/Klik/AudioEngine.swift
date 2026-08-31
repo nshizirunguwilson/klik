@@ -80,6 +80,11 @@ final class AudioEngine {
     /// How many restarts in a row have failed, used to space out the retries.
     private var failedRestarts = 0
 
+    /// Called on the main thread when the sound output starts or stops working.
+    /// nil means it is fine. The app shows this in the menu, because a silent
+    /// app with no explanation is the thing this whole fix is about.
+    var onOutputProblem: ((String?) -> Void)?
+
     private var lowLatencyEnabled = true
     /// Pin playback to the laptop's own speakers regardless of where the rest of
     /// the system's audio is going.
@@ -124,8 +129,10 @@ final class AudioEngine {
             // scheduleBuffer with no state transition behind it.
             players.forEach { $0.play() }
             isRunning = true
+            report(problem: nil)
             log.notice("Engine started, \(Self.voiceCount) voices, IO buffer \(self.ioBufferFrames) frames")
         } catch {
+            report(problem: "Could not start sound output")
             log.error("Engine failed to start: \(error.localizedDescription, privacy: .public)")
         }
     }
@@ -191,6 +198,11 @@ final class AudioEngine {
         scheduleRestart(reason: "engine drifted", after: 0)
     }
 
+    private func report(problem: String?) {
+        guard let onOutputProblem else { return }
+        DispatchQueue.main.async { onOutputProblem(problem) }
+    }
+
     /// Queues a restart, replacing any restart already waiting.
     ///
     /// Connecting one pair of AirPods raises several changes in a row. Acting on
@@ -222,6 +234,7 @@ final class AudioEngine {
             players.forEach { $0.play() }
             isRunning = true
             failedRestarts = 0
+            report(problem: nil)
             log.notice("Restarted (\(reason, privacy: .public)), built-in: \(self.isUsingBuiltInOutput), IO buffer \(self.ioBufferFrames) frames")
         } catch {
             isRunning = false
@@ -231,6 +244,12 @@ final class AudioEngine {
             // difference between sound returning on its own and never.
             let wait = min(8, 0.25 * pow(2, Double(failedRestarts - 1)))
             log.error("Restart failed (attempt \(self.failedRestarts)): \(error.localizedDescription, privacy: .public), retrying in \(wait)s")
+            // Say nothing about the first stumble. Devices routinely refuse the
+            // first attempt and are ready by the second, and a warning that
+            // appears and vanishes is worse than none.
+            if failedRestarts > 1 {
+                report(problem: "Sound output is not responding, keeping trying")
+            }
             scheduleRestart(reason: "retry after a failed restart", after: wait)
         }
     }

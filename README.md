@@ -42,6 +42,10 @@ tools/create_signing_identity.sh
 
 Override the choice with `KLIK_SIGN_IDENTITY="Some Identity" ./build.sh`.
 
+See [RUNNING.md](RUNNING.md) for updating, permissions, tests, logs and
+setting up on a new Mac. See [DOCUMENTATION.md](DOCUMENTATION.md) for how it
+works inside.
+
 ## Checking it without granting permission
 
 ```sh

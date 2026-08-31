@@ -527,48 +527,18 @@ final class AudioEngine {
         return defaultOutputDevice
     }
 
-    /// The laptop's own speakers, found by transport type rather than by name,
-    /// which would break on non-English systems and across models.
+    /// The laptop's own speakers.
+    ///
+    /// This asks `OutputDevices`, which also checks that nothing is plugged into
+    /// the headphone jack. The jack shares the built-in device, so when
+    /// earphones are in it that device routes to the earphones and pinning to it
+    /// would not keep the sound in the room the way the setting promises.
+    ///
+    /// The engine used to look this up itself and check only the transport, so
+    /// it happily pinned to the built-in device with earphones plugged into it,
+    /// while the menu said the sound was going to the speakers.
     private var builtInOutputDevice: AudioDeviceID? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDevices,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var size = UInt32(0)
-        guard AudioObjectGetPropertyDataSize(
-            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr else { return nil }
-
-        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
-        guard count > 0 else { return nil }
-        var devices = [AudioDeviceID](repeating: 0, count: count)
-        guard AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &devices) == noErr else { return nil }
-
-        for device in devices where hasOutputStreams(device) {
-            var transportAddress = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyTransportType,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain
-            )
-            var transport = UInt32(0)
-            var transportSize = UInt32(MemoryLayout<UInt32>.size)
-            guard AudioObjectGetPropertyData(
-                device, &transportAddress, 0, nil, &transportSize, &transport) == noErr else { continue }
-            if transport == kAudioDeviceTransportTypeBuiltIn { return device }
-        }
-        return nil
-    }
-
-    private func hasOutputStreams(_ device: AudioDeviceID) -> Bool {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyStreams,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var size = UInt32(0)
-        guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr else { return false }
-        return size > 0
+        OutputDevices.builtInSpeakers
     }
 
     /// Asks the output device for a smaller render quantum. The default of 512

@@ -177,6 +177,18 @@ final class AudioEngine {
         scheduleRestart(reason: "audio devices changed")
     }
 
+    /// Backstop for anything the notifications miss: restarts if the engine has
+    /// stopped, or has drifted onto a device other than the one it should be on.
+    /// Cheap enough to call on a timer.
+    func verifyHealth() {
+        guard hasBuiltGraph, pendingRestart == nil else { return }
+        let wanted = activeOutputDevice
+        let actual = engine.outputNode.auAudioUnit.deviceID
+        guard !engine.isRunning || (wanted != nil && wanted != actual) else { return }
+        log.notice("Engine drifted (running \(self.engine.isRunning), device \(actual), wanted \(wanted ?? 0))")
+        scheduleRestart(reason: "engine drifted", after: 0)
+    }
+
     /// Queues a restart, replacing any restart already waiting.
     ///
     /// Connecting one pair of AirPods raises several changes in a row. Acting on
@@ -649,6 +661,9 @@ final class AudioEngine {
         }
         return value as String
     }
+
+    /// How many voices are started, for the device test.
+    var playingVoiceCount: Int { players.filter { $0.isPlaying }.count }
 
     /// Frame count and peak amplitude of a loaded key, for the self-test.
     /// A slice that decodes but is silent means the offsets are wrong.

@@ -400,6 +400,7 @@ final class AppState: ObservableObject {
         // Backstop for the device notifications, in case one is ever missed.
         refreshExternalAudio()
         refreshMicrophone()
+        audio.verifyHealth()
         let alive = keyTap.ensureAlive()
         tapIsAlive = alive
         if !alive {

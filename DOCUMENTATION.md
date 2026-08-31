@@ -203,6 +203,7 @@ klik/
     LoginItem.swift                   launch at login
     Accessibility.swift               permission check and prompt
     SelfTest.swift                    command line diagnostics
+    DeviceTest.swift                  audio device change diagnostics
 
   Resources/
     Info.plist                        bundle metadata
@@ -433,6 +434,13 @@ open the right settings pane.
 
 Command line diagnostics, described in section 11.
 
+### 5.14 DeviceTest.swift
+
+The audio device change test, described in section 11.1. Kept apart from
+`SelfTest.swift` because it is the only check that changes the state of the
+machine while it runs, switching the system default output device and putting it
+back afterwards.
+
 ---
 
 ## 6. Sound packs
@@ -613,9 +621,9 @@ in place. The menu bar glyph reflects the state.
 ### Status line
 Says `Listening`, the output latency and where sound is going, for example
 `Listening, 2.8 ms, speakers`. If Klik is quiet, this line says exactly why:
-waiting for permission, listener stopped, muted, microphone in use, headphones
-connected, or volume at zero. This is the first place to look when something seems
-wrong.
+waiting for permission, listener stopped, sound output not responding, muted,
+microphone in use, headphones connected, or volume at zero. This is the first
+place to look when something seems wrong.
 
 ### Mute shortcut label, top right
 Shows the global shortcut, Control Option Command M, when it registered
@@ -702,6 +710,27 @@ loads perfectly but decodes to silence because the offsets are wrong. The mixer
 measurement proves the graph is really producing audio, which separates "producing
 nothing" from "producing something you cannot hear".
 
+### 11.1 The device test
+
+```sh
+/Applications/Klik.app/Contents/MacOS/Klik --devicetest
+/Applications/Klik.app/Contents/MacOS/Klik --devicetest <path>   # a specific pack
+```
+
+A second output device has to be connected, otherwise it skips. It switches the
+system default output device several times, pins and unpins the built in
+speakers, then connects and disconnects repeatedly, measuring what the mixer
+actually renders at every step. The original default device is put back at the
+end.
+
+This exists because the ordinary self test cannot see the failure in section
+12.9. Everything the engine reports about itself stays healthy across a device
+change, so the only way to catch it is to listen to the output before and after
+each change. Alongside each measurement it prints whether the engine believes it
+is running, which device it is on and how many voices are playing, and when a
+step does go silent it forces a restart and measures again, which says whether
+the engine was wedged or genuinely broken.
+
 ---
 
 ## 12. Problems hit during development
@@ -773,7 +802,54 @@ sleep to appear.
 Klik was reported as not working when every measurement said it was fine. The
 cause was that the status line only reported permission and listener problems, so
 a mute or an active silence rule still displayed `Listening`. Solved with the
-single silence reason property that reports all six causes.
+single silence reason property that reports every cause in one place.
+
+### 12.9 Sound stopped for good when headphones were connected
+
+The most stubborn failure, and the closest relative of 12.7.
+
+Reported as: everything works with nothing connected, connect AirPods or wired
+earphones and the sound stops, disconnect them again and it never comes back
+until the app is restarted. The silence rule for headphones was switched off, so
+that was not the cause.
+
+Four separate faults were behind it, each capable of causing it alone.
+
+**The graph was never rewired.** Changing the output device gives the output node
+a new format, but the mixer stays connected to it through a connection built for
+the device that left. That connection is never remade, so the mixer renders into
+a dead end. This was the main cause, and the hardest to see, because nothing
+reports an error: the engine says it is running, every one of the 24 voices says
+it is connected and playing, and the measured output is exactly zero. Solved by
+reconnecting the mixer and the voices after every device change.
+
+**A failed restart was permanent.** The running flag was cleared when a restart
+failed and never set back when one worked. Every recovery path was gated behind
+that flag, so a single failure stopped the app from ever trying again. This is
+the part that matches "it never works again". Solved by splitting the flag in
+two: one for the graph being wired, which gates recovery, and one for the engine
+actually producing audio.
+
+**Nothing told the engine to restart.** The engine listened only for its own
+configuration change notice. That notice does not fire when the default output
+device is simply switched, which was confirmed directly: switching the default
+output device produced zero configuration changes. It also does not fire when
+macOS idles the built-in speakers after everything else moves to headphones.
+Solved by listening to the CoreAudio device notices as well, and by a check every
+five seconds that the engine is still on the device it should be on.
+
+**Restarts arrived in bursts.** One pair of AirPods connecting raises several
+device changes over about a second. Restarting on each one cuts off any sound
+that is playing. Solved by waiting for the changes to stop before restarting.
+
+Two smaller faults were found while fixing those. Turning off the built in
+speaker setting only changed a flag and left the output pinned to the old device,
+so the setting appeared to do nothing. And the engine had its own copy of the
+built in speaker lookup that checked only the transport type, so it would pin to
+the built in device while earphones were plugged into its jack, sending typing
+into the earphones while the menu said it was going to the speakers.
+
+Section 11.1 describes the test written to catch all of this.
 
 ---
 
@@ -812,6 +888,8 @@ and that is already close to the practical floor.
 | `Silent, ... in use` | A microphone is active. Expected during calls. |
 | `Silent, ... connected` | Headphones are connected. Expected. |
 | `Silent, volume is at 0%` | Raise the volume slider. |
+| `Sound output is not responding` | An output device is refusing to start. Klik keeps retrying on its own, waiting longer each time. |
+| Silent after connecting headphones | Should not happen any more, see section 12.9. Run `--devicetest` to confirm, and check the status line for a reason. |
 | One key is silent | Open the menu and press it. Nothing in Last key means it never arrived, `no sound` means the pack lacks it. |
 | Crackling in other apps | Turn off the low latency audio buffer. |
 | Pack fails to load | It is probably Ogg. Run `tools/prepare_pack.sh` on it. |
@@ -822,6 +900,7 @@ For deeper inspection:
 ```sh
 /usr/bin/log show --last 10m --predicate 'subsystem == "com.klik.Klik"'
 /Applications/Klik.app/Contents/MacOS/Klik --selftest
+/Applications/Klik.app/Contents/MacOS/Klik --devicetest
 ```
 
 Note the full path to `log`. Some shells define their own `log` function that

@@ -4,6 +4,9 @@ import SwiftUI
 enum KlikMain {
     static func main() {
         let arguments = CommandLine.arguments
+        if arguments.contains("--devicetest") {
+            exit(DeviceTest.run(packPath: arguments.dropFirst().first { !$0.hasPrefix("--") }))
+        }
         if arguments.contains("--selftest") || arguments.contains("--demo") {
             let packPath = arguments.dropFirst().first { !$0.hasPrefix("--") }
             exit(SelfTest.run(audible: arguments.contains("--demo"), packPath: packPath))

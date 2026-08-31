@@ -111,6 +111,9 @@ final class AudioEngine {
             name: .AVAudioEngineConfigurationChange,
             object: engine
         )
+        OutputDevices.startMonitoring { [weak self] in
+            self?.outputDevicesChanged()
+        }
 
         engine.prepare()
         do {
@@ -156,6 +159,22 @@ final class AudioEngine {
     /// built-in speakers, which is exactly the moment that matters.
     @objc private func handleConfigurationChange() {
         scheduleRestart(reason: "output device changed")
+    }
+
+    /// Called whenever an audio device appears, disappears, or becomes the
+    /// system's default.
+    ///
+    /// The engine does not raise a configuration change for a plain switch of
+    /// the default output device, and pinning to the built-in speakers does not
+    /// stop macOS from idling that device once everything else has moved to
+    /// headphones. In both cases the engine goes on reporting itself as running,
+    /// with every voice connected and playing, and renders nothing at all.
+    ///
+    /// There is no reliable flag for that state, so any device change is treated
+    /// as a reason to rebuild. A restart is a few milliseconds and is silent.
+    func outputDevicesChanged() {
+        guard hasBuiltGraph else { return }
+        scheduleRestart(reason: "audio devices changed")
     }
 
     /// Queues a restart, replacing any restart already waiting.

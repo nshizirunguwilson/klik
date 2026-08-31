@@ -177,16 +177,26 @@ final class AudioEngine {
     /// This has to happen while the engine is stopped -- the output unit will not
     /// change device underneath a running graph.
     private func applyOutputDevice() {
-        guard forceBuiltInOutput, let device = builtInOutputDevice else {
-            isUsingBuiltInOutput = false
-            return
+        if forceBuiltInOutput, let device = builtInOutputDevice {
+            do {
+                try engine.outputNode.auAudioUnit.setDeviceID(device)
+                isUsingBuiltInOutput = true
+                return
+            } catch {
+                log.error("Could not pin built-in output: \(error.localizedDescription, privacy: .public)")
+            }
         }
+
+        // Follow the system again. Without this the output unit keeps whichever
+        // device it was last pinned to, which after a disconnect can be a device
+        // that is no longer there. That is a silent engine with nothing to say
+        // for itself.
+        isUsingBuiltInOutput = false
+        guard let device = defaultOutputDevice else { return }
         do {
             try engine.outputNode.auAudioUnit.setDeviceID(device)
-            isUsingBuiltInOutput = true
         } catch {
-            isUsingBuiltInOutput = false
-            log.error("Could not pin built-in output: \(error.localizedDescription, privacy: .public)")
+            log.error("Could not follow system output: \(error.localizedDescription, privacy: .public)")
         }
     }
 

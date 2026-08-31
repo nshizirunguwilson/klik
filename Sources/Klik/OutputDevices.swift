@@ -133,7 +133,10 @@ enum OutputDevices {
 
     // MARK: - Monitoring
 
-    private static var listenerBlock: AudioObjectPropertyListenerBlock?
+    /// Every block registered so far. Both the app and the audio engine want to
+    /// hear about device changes, for different reasons, so this keeps a list
+    /// rather than a single block.
+    private static var listeners: [AudioObjectPropertyListenerBlock] = []
 
     /// Calls `onChange` whenever devices come or go, or the built-in output
     /// switches between speakers and the headphone jack.
@@ -144,7 +147,7 @@ enum OutputDevices {
         let block: AudioObjectPropertyListenerBlock = { _, _ in
             DispatchQueue.main.async(execute: onChange)
         }
-        listenerBlock = block
+        listeners.append(block)
 
         var deviceList = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,

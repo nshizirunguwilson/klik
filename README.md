@@ -45,19 +45,25 @@ Override the choice with `KLIK_SIGN_IDENTITY="Some Identity" ./build.sh`.
 ## Checking it without granting permission
 
 ```sh
-./build/Klik.app/Contents/MacOS/Klik --demo      # audible: types "klik"
-./build/Klik.app/Contents/MacOS/Klik --selftest  # silent: packs, buffers, timings
+./build/Klik.app/Contents/MacOS/Klik --demo        # audible: types "klik"
+./build/Klik.app/Contents/MacOS/Klik --selftest    # silent: packs, buffers, timings
+./build/Klik.app/Contents/MacOS/Klik --devicetest  # audible: survives device changes
 ```
 
 `--selftest` reports what loaded, the audio buffers' peak levels, the render quantum
 the output device granted, and the cost of the per-keystroke path.
+
+`--devicetest` needs a second output device connected. It switches the system
+output back and forth, pinning and unpinning the built-in speakers, and measures
+what actually comes out at each step. It puts your original output device back
+when it finishes.
 
 ## The menu
 
 | Control | What it does |
 |---|---|
 | Master toggle | Silences Klik without quitting it. Also bound to **⌃⌥⌘M** globally. |
-| Status line | `Listening` plus the output latency; or `Waiting for permission`. |
+| Status line | `Listening` plus the output latency; or the reason it is quiet. |
 | Sound pack | Which recording to use. ABS is brighter, PBT is deeper. |
 | Volume | Output level, independent of system volume. |
 | Variation | Per-keystroke pitch and gain drift. At 0 the repetition becomes audible. |
@@ -166,6 +172,7 @@ Sources/Klik/
   KeyCodes.swift     macOS virtual key codes → pack key identifiers
   SoundPack.swift    v1 and v2 config parsing
   SelfTest.swift     --selftest / --demo
+  DeviceTest.swift   --devicetest
 SoundPacks/          bundled packs, copied into the app at build time
 tools/prepare_pack.sh
 ```

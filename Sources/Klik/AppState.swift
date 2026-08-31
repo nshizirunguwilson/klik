@@ -130,6 +130,9 @@ final class AppState: ObservableObject {
     @Published private(set) var externalAudio: String?
     /// Name of a microphone currently recording, if any.
     @Published private(set) var activeMicrophone: String?
+    /// Set when sound output itself has stopped working, as opposed to being
+    /// deliberately held quiet.
+    @Published private(set) var audioProblem: String?
 
     /// True when external audio is holding Klik at zero.
     var isSilencedByExternalAudio: Bool {
@@ -146,6 +149,7 @@ final class AppState: ObservableObject {
     var silenceReason: String? {
         if !isTrusted { return "Waiting for permission" }
         if !tapIsAlive { return "Listener stopped, reconnecting" }
+        if let audioProblem { return audioProblem }
         if !isEnabled { return "Muted, press \(GlobalHotKey.muteDescription) to unmute" }
         if isSilencedByMicrophone { return "Silent, \(activeMicrophone ?? "microphone") in use" }
         if isSilencedByExternalAudio { return "Silent, \(externalAudio ?? "headphones") connected" }
@@ -198,6 +202,9 @@ final class AppState: ObservableObject {
         }
 
         audio.pitchVariance = pitchVariance
+        audio.onOutputProblem = { [weak self] problem in
+            MainActor.assumeIsolated { self?.audioProblem = problem }
+        }
         audio.start(lowLatencyBuffer: lowLatencyBuffer, builtInOutput: builtInOutput)
 
         startWatchingAudioDevices()
@@ -400,6 +407,7 @@ final class AppState: ObservableObject {
         // Backstop for the device notifications, in case one is ever missed.
         refreshExternalAudio()
         refreshMicrophone()
+        audio.verifyHealth()
         let alive = keyTap.ensureAlive()
         tapIsAlive = alive
         if !alive {

@@ -34,9 +34,10 @@ private struct PlaybackState: @unchecked Sendable {
 ///
 ///  1. Every sample is decoded to PCM at load time and sliced into a ready-made
 ///     buffer per key. Nothing touches the disk or a decoder while typing.
-///  2. The node graph is built once at startup and never rewired. Player nodes
-///     are started immediately and left running -- an idle player renders
-///     silence, so a keystroke costs one `scheduleBuffer` call and nothing else.
+///  2. The node graph is built once and only rewired when the output device
+///     changes. Player nodes are started immediately and left running -- an idle
+///     player renders silence, so a keystroke costs one `scheduleBuffer` call
+///     and nothing else.
 ///  3. The hardware buffer is shrunk as far as the output device allows, which
 ///     is the single biggest remaining term.
 final class AudioEngine {
@@ -58,12 +59,31 @@ final class AudioEngine {
 
     private let state = OSAllocatedUnfairLock(initialState: PlaybackState())
 
+    /// Whether the engine is producing audio right now.
     private(set) var isRunning = false
+    /// Whether the voices have been attached. Separate from `isRunning` on
+    /// purpose: a failed restart leaves the graph built but not running, and
+    /// recovery has to stay possible from there.
+    private var hasBuiltGraph = false
     /// Frames per render cycle actually granted by the output device.
     private(set) var ioBufferFrames: UInt32 = 0
     /// What each device's buffer was set to before Klik touched it, so the
     /// setting can be put back rather than left changed for every other app.
     private var originalIOBufferFrames: [AudioDeviceID: UInt32] = [:]
+
+    /// A restart waiting for the device changes to stop arriving.
+    private var pendingRestart: DispatchWorkItem?
+    /// How long to wait for a burst of device changes to finish. Bluetooth
+    /// devices announce themselves several times over about a second as they
+    /// settle, and restarting on each one stops the sound mid-play.
+    private static let restartDelay: TimeInterval = 0.35
+    /// How many restarts in a row have failed, used to space out the retries.
+    private var failedRestarts = 0
+
+    /// Called on the main thread when the sound output starts or stops working.
+    /// nil means it is fine. The app shows this in the menu, because a silent
+    /// app with no explanation is the thing this whole fix is about.
+    var onOutputProblem: ((String?) -> Void)?
 
     private var lowLatencyEnabled = true
     /// Pin playback to the laptop's own speakers regardless of where the rest of
@@ -74,7 +94,7 @@ final class AudioEngine {
     // MARK: - Lifecycle
 
     func start(lowLatencyBuffer: Bool, builtInOutput: Bool) {
-        guard !isRunning else { return }
+        guard !hasBuiltGraph else { return }
 
         lowLatencyEnabled = lowLatencyBuffer
         forceBuiltInOutput = builtInOutput
@@ -86,11 +106,11 @@ final class AudioEngine {
             let varispeed = AVAudioUnitVarispeed()
             engine.attach(player)
             engine.attach(varispeed)
-            engine.connect(player, to: varispeed, format: Self.canonicalFormat)
-            engine.connect(varispeed, to: engine.mainMixerNode, format: Self.canonicalFormat)
             players.append(player)
             varispeeds.append(varispeed)
         }
+        hasBuiltGraph = true
+        connectGraph()
 
         NotificationCenter.default.addObserver(
             self,
@@ -98,6 +118,9 @@ final class AudioEngine {
             name: .AVAudioEngineConfigurationChange,
             object: engine
         )
+        OutputDevices.startMonitoring { [weak self] in
+            self?.outputDevicesChanged()
+        }
 
         engine.prepare()
         do {
@@ -106,9 +129,37 @@ final class AudioEngine {
             // scheduleBuffer with no state transition behind it.
             players.forEach { $0.play() }
             isRunning = true
+            report(problem: nil)
             log.notice("Engine started, \(Self.voiceCount) voices, IO buffer \(self.ioBufferFrames) frames")
         } catch {
+            report(problem: "Could not start sound output")
             log.error("Engine failed to start: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Wires the voices into the mixer and the mixer into the output device.
+    ///
+    /// This has to be redone after every output device change, and that is the
+    /// whole reason the bug existed. Changing the device gives the output node a
+    /// new format, but the mixer is still connected to it through a connection
+    /// shaped for the device that just left. Nothing complains. The engine keeps
+    /// saying it is running, every voice keeps saying it is connected and
+    /// playing, and the mixer renders pure silence into the stale connection.
+    ///
+    /// Reconnecting is what makes the engine notice the new device at all.
+    private func connectGraph() {
+        // The mixer talks to the hardware in the hardware's own format and
+        // converts for us. The voices stay on the canonical format, which is
+        // what every pack was decoded into.
+        let hardware = engine.outputNode.outputFormat(forBus: 0)
+        let outputFormat = hardware.sampleRate > 0 && hardware.channelCount > 0
+            ? hardware
+            : Self.canonicalFormat
+        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: outputFormat)
+
+        for index in players.indices {
+            engine.connect(players[index], to: varispeeds[index], format: Self.canonicalFormat)
+            engine.connect(varispeeds[index], to: engine.mainMixerNode, format: Self.canonicalFormat)
         }
     }
 
@@ -116,24 +167,90 @@ final class AudioEngine {
     /// AirPods connecting, a display unplugged. Restarting also re-pins the
     /// built-in speakers, which is exactly the moment that matters.
     @objc private func handleConfigurationChange() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.isRunning else { return }
-            self.restart(reason: "output device changed")
-        }
+        scheduleRestart(reason: "output device changed")
     }
+
+    /// Called whenever an audio device appears, disappears, or becomes the
+    /// system's default.
+    ///
+    /// The engine does not raise a configuration change for a plain switch of
+    /// the default output device, and pinning to the built-in speakers does not
+    /// stop macOS from idling that device once everything else has moved to
+    /// headphones. In both cases the engine goes on reporting itself as running,
+    /// with every voice connected and playing, and renders nothing at all.
+    ///
+    /// There is no reliable flag for that state, so any device change is treated
+    /// as a reason to rebuild. A restart is a few milliseconds and is silent.
+    func outputDevicesChanged() {
+        guard hasBuiltGraph else { return }
+        scheduleRestart(reason: "audio devices changed")
+    }
+
+    /// Backstop for anything the notifications miss: restarts if the engine has
+    /// stopped, or has drifted onto a device other than the one it should be on.
+    /// Cheap enough to call on a timer.
+    func verifyHealth() {
+        guard hasBuiltGraph, pendingRestart == nil else { return }
+        let wanted = activeOutputDevice
+        let actual = engine.outputNode.auAudioUnit.deviceID
+        guard !engine.isRunning || (wanted != nil && wanted != actual) else { return }
+        log.notice("Engine drifted (running \(self.engine.isRunning), device \(actual), wanted \(wanted ?? 0))")
+        scheduleRestart(reason: "engine drifted", after: 0)
+    }
+
+    private func report(problem: String?) {
+        guard let onOutputProblem else { return }
+        DispatchQueue.main.async { onOutputProblem(problem) }
+    }
+
+    /// Queues a restart, replacing any restart already waiting.
+    ///
+    /// Connecting one pair of AirPods raises several changes in a row. Acting on
+    /// each one restarts the engine repeatedly, and a restart that lands while a
+    /// key is sounding cuts it off. Waiting for the changes to stop means one
+    /// restart per real event.
+    private func scheduleRestart(reason: String, after delay: TimeInterval? = nil) {
+        pendingRestart?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.hasBuiltGraph else { return }
+            self.pendingRestart = nil
+            self.restart(reason: reason)
+        }
+        pendingRestart = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (delay ?? Self.restartDelay), execute: work)
+    }
+
+    /// True once no restart is waiting and the engine is producing audio.
+    var isSettled: Bool { pendingRestart == nil && isRunning }
 
     private func restart(reason: String) {
         engine.stop()
         applyOutputDevice()
         applyIOBuffer()
+        connectGraph()
         do {
             engine.prepare()
             try engine.start()
             players.forEach { $0.play() }
+            isRunning = true
+            failedRestarts = 0
+            report(problem: nil)
             log.notice("Restarted (\(reason, privacy: .public)), built-in: \(self.isUsingBuiltInOutput), IO buffer \(self.ioBufferFrames) frames")
         } catch {
             isRunning = false
-            log.error("Restart failed: \(error.localizedDescription, privacy: .public)")
+            failedRestarts += 1
+            // A device that is still settling refuses to start, and a moment
+            // later it is ready. Backing off rather than giving up is the
+            // difference between sound returning on its own and never.
+            let wait = min(8, 0.25 * pow(2, Double(failedRestarts - 1)))
+            log.error("Restart failed (attempt \(self.failedRestarts)): \(error.localizedDescription, privacy: .public), retrying in \(wait)s")
+            // Say nothing about the first stumble. Devices routinely refuse the
+            // first attempt and are ready by the second, and a warning that
+            // appears and vanishes is worse than none.
+            if failedRestarts > 1 {
+                report(problem: "Sound output is not responding, keeping trying")
+            }
+            scheduleRestart(reason: "retry after a failed restart", after: wait)
         }
     }
 
@@ -143,16 +260,26 @@ final class AudioEngine {
     /// This has to happen while the engine is stopped -- the output unit will not
     /// change device underneath a running graph.
     private func applyOutputDevice() {
-        guard forceBuiltInOutput, let device = builtInOutputDevice else {
-            isUsingBuiltInOutput = false
-            return
+        if forceBuiltInOutput, let device = builtInOutputDevice {
+            do {
+                try engine.outputNode.auAudioUnit.setDeviceID(device)
+                isUsingBuiltInOutput = true
+                return
+            } catch {
+                log.error("Could not pin built-in output: \(error.localizedDescription, privacy: .public)")
+            }
         }
+
+        // Follow the system again. Without this the output unit keeps whichever
+        // device it was last pinned to, which after a disconnect can be a device
+        // that is no longer there. That is a silent engine with nothing to say
+        // for itself.
+        isUsingBuiltInOutput = false
+        guard let device = defaultOutputDevice else { return }
         do {
             try engine.outputNode.auAudioUnit.setDeviceID(device)
-            isUsingBuiltInOutput = true
         } catch {
-            isUsingBuiltInOutput = false
-            log.error("Could not pin built-in output: \(error.localizedDescription, privacy: .public)")
+            log.error("Could not follow system output: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -171,7 +298,7 @@ final class AudioEngine {
     }
 
     func setBuiltInOutput(_ enabled: Bool) {
-        guard isRunning, enabled != forceBuiltInOutput else {
+        guard hasBuiltGraph, enabled != forceBuiltInOutput else {
             forceBuiltInOutput = enabled
             return
         }
@@ -186,14 +313,16 @@ final class AudioEngine {
     /// which is why the setting can be a live toggle rather than a relaunch.
     func setLowLatency(_ enabled: Bool) {
         lowLatencyEnabled = enabled
-        guard isRunning else { return }
+        guard hasBuiltGraph else { return }
         restart(reason: enabled ? "low latency on" : "low latency off")
     }
 
     /// Puts the device's buffer size back on the way out, so quitting Klik does
     /// not leave the setting changed for everything else.
     func shutdown() {
-        guard isRunning else { return }
+        guard hasBuiltGraph else { return }
+        pendingRestart?.cancel()
+        pendingRestart = nil
         players.forEach { $0.stop() }
         engine.stop()
         for (device, frames) in originalIOBufferFrames {
@@ -417,48 +546,18 @@ final class AudioEngine {
         return defaultOutputDevice
     }
 
-    /// The laptop's own speakers, found by transport type rather than by name,
-    /// which would break on non-English systems and across models.
+    /// The laptop's own speakers.
+    ///
+    /// This asks `OutputDevices`, which also checks that nothing is plugged into
+    /// the headphone jack. The jack shares the built-in device, so when
+    /// earphones are in it that device routes to the earphones and pinning to it
+    /// would not keep the sound in the room the way the setting promises.
+    ///
+    /// The engine used to look this up itself and check only the transport, so
+    /// it happily pinned to the built-in device with earphones plugged into it,
+    /// while the menu said the sound was going to the speakers.
     private var builtInOutputDevice: AudioDeviceID? {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDevices,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var size = UInt32(0)
-        guard AudioObjectGetPropertyDataSize(
-            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr else { return nil }
-
-        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
-        guard count > 0 else { return nil }
-        var devices = [AudioDeviceID](repeating: 0, count: count)
-        guard AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &devices) == noErr else { return nil }
-
-        for device in devices where hasOutputStreams(device) {
-            var transportAddress = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyTransportType,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain
-            )
-            var transport = UInt32(0)
-            var transportSize = UInt32(MemoryLayout<UInt32>.size)
-            guard AudioObjectGetPropertyData(
-                device, &transportAddress, 0, nil, &transportSize, &transport) == noErr else { continue }
-            if transport == kAudioDeviceTransportTypeBuiltIn { return device }
-        }
-        return nil
-    }
-
-    private func hasOutputStreams(_ device: AudioDeviceID) -> Bool {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyStreams,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var size = UInt32(0)
-        guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr else { return false }
-        return size > 0
+        OutputDevices.builtInSpeakers
     }
 
     /// Asks the output device for a smaller render quantum. The default of 512
@@ -560,6 +659,9 @@ final class AudioEngine {
         }
         return value as String
     }
+
+    /// How many voices are started, for the device test.
+    var playingVoiceCount: Int { players.filter { $0.isPlaying }.count }
 
     /// Frame count and peak amplitude of a loaded key, for the self-test.
     /// A slice that decodes but is silent means the offsets are wrong.

@@ -302,7 +302,7 @@ Other symptoms:
 | App is completely silent, no obvious reason | Run `--selftest` first, then `--devicetest`. Between them they cover packs, decoding, the graph and device switching. |
 | Klik is gone and nobody quit it | Should not happen any more: the app now refuses automatic and sudden termination, and the audio exception that used to abort it is gone. To confirm, `log show --last 1d --predicate 'subsystem == "com.klik.Klik"'` and look for `Automatic and sudden termination disabled` at launch, and for any `Uncaught exception` line. |
 | A setting reverts after a restart | Run `--settings`. It prints what is actually stored. A change made in the menu is written immediately for the sound pack, and within half a second for everything else. |
-| All the packs sound the same | The eight recorded packs genuinely do cluster together. The eight designed ones (Deep Thock through Paper Tap) are built to be unlike each other; the line under the picker says what each one is. |
+| Not sure which pack is which | The line under the picker says what each one is. EG Oreo is the quiet one, CherryMX Black PBT the middle one, CherryMX Blue ABS the loud clicky one. |
 
 ---
 
@@ -324,8 +324,7 @@ and you get an app that runs perfectly and makes no sound at all.
 
 ```sh
 brew install ffmpeg
-tools/prepare_pack.sh SoundPacks/cherrymx-* SoundPacks/eg-* SoundPacks/topre-*
-python3 tools/make_sound_packs.py
+tools/prepare_pack.sh SoundPacks/*
 ```
 
 The build warns you by name about any pack that would ship silent, so you will

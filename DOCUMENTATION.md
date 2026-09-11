@@ -143,11 +143,11 @@ which the mixer walks through the sample, with linear interpolation between
 frames; gain is a multiplier on the voice. The amount is controlled by the
 Variation slider, and setting it to zero disables the effect entirely.
 
-A second thing that breaks it is loudness. Packs come from different places and
-measured across the set they spanned about 24 dB, so switching packs was mostly a
-change in volume, which drowns out the difference in character you are trying to
-hear. `tools/level_packs.py` measures each pack and writes a playback gain into
-its config; the engine applies it when the pack loads.
+A second thing that breaks it is loudness. Packs are recorded by different people
+at whatever gain they used, and the three bundled ones sat about 15 dB apart. That
+made switching packs mostly a change in volume, which drowns out the difference in
+character you are trying to hear. `tools/level_packs.py` measures each pack and
+writes a playback gain into its config; the engine applies it when the pack loads.
 
 ---
 
@@ -238,10 +238,9 @@ klik/
     Info.plist                        bundle metadata
     AppIcon.icns                      generated icon
 
-  SoundPacks/                         sixteen bundled packs
+  SoundPacks/                         three bundled packs
   tools/
     prepare_pack.sh                   Ogg to WAV conversion
-    make_sound_packs.py               synthesises the eight designed packs
     level_packs.py                    measures and levels every pack
     make_icon.swift                   draws the app icon
     create_signing_identity.sh        makes a self signed certificate

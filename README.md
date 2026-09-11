@@ -87,39 +87,18 @@ nothing for it.
 
 ## Sound packs
 
-Sixteen packs ship with the app, in two families.
-
-**Designed packs**, built by `tools/make_sound_packs.py`. Each one is deliberately
-unlike every other, so picking between them is something you can do by ear:
+Three packs ship with the app, from the MechvibesDX collection, chosen to be
+distinguishable from each other rather than to cover the switch catalogue:
 
 | Pack | Character | Centre | Length |
 |---|---|---|---|
-| Deep Thock | Low and muffled, nothing above 1.5 kHz | 165 Hz | 116 ms |
-| Water Drop | A pure tone sliding upward, no click at all | 653 Hz | 178 ms |
-| Wood Block | A hollow harmonic knock | 805 Hz | 105 ms |
-| Bubble Pop | Short, high, falling in pitch | 1.1 kHz | 52 ms |
-| Glass Bell | Inharmonic partials that ring on | 3.0 kHz | 441 ms |
-| Retro Blip | Stepped square waves, unapologetically 8-bit | 4.1 kHz | 79 ms |
-| Typewriter | Metallic strike over a heavy carriage thunk | 4.8 kHz | 137 ms |
-| Paper Tap | Dry filtered noise, no pitch whatsoever | 9.8 kHz | 29 ms |
+| EG Oreo | The quiet one. Short, low and soft, with none of the Cherry click | 3.8 kHz | 54 ms |
+| CherryMX Black (PBT) | The middle one. Linear and firm, no click | 5.3 kHz | 80 ms |
+| CherryMX Blue (ABS) | The loud one. A sharp, high, unmistakable click | 9.7 kHz | 98 ms |
 
-**Recorded packs**, from the MechvibesDX collection. These are faithful recordings of
-real switches, and several of them measure almost identically, which is the reason the
-designed family exists:
-
-| Pack | Character |
-|---|---|
-| CherryMX Blue (ABS) | Sharp click, the brightest of the recorded set |
-| CherryMX Black (ABS / PBT) | Linear and firm; the two are near-indistinguishable |
-| CherryMX Brown (PBT) | Tactile bump, muted middle ground |
-| CherryMX Red (ABS) | Light and quick |
-| Topre Purple Hybrid (PBT) | Soft rounded "thock" |
-| EG Oreo | The shortest recorded sample here |
-| EG Crystal Purple | Short and light |
-
-Every pack carries a one-line description, shown under the picker, and a playback gain
+Each pack carries a one-line description, shown under the picker, and a playback gain
 measured by `tools/level_packs.py` so that switching packs changes the character rather
-than the volume.
+than the volume. Left alone, the three sat about 15 dB apart.
 
 Drop more into:
 
@@ -218,6 +197,5 @@ Sources/Klik/
   DeviceTest.swift     --devicetest
 SoundPacks/            bundled packs, copied into the app at build time
 tools/prepare_pack.sh      convert a downloaded pack's .ogg to .wav
-tools/make_sound_packs.py  synthesise the eight designed packs
 tools/level_packs.py       measure each pack and set its playback gain
 ```

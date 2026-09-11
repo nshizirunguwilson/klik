@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Levels every sound pack to the same loudness.
 
-Packs come from different places -- some recorded off a real keyboard at
-whatever gain the author used, some synthesised here -- and measured across the
-set they span about 24 dB. That is not a small thing when the packs are meant to
-be compared: switching from EG Oreo to Deep Thock was mostly a jump in volume,
-which drowns out the difference in character that you are actually trying to
-hear, and means the volume slider has to be re-set after every change.
+Packs are recorded by different people at whatever gain they happened to use, and
+measured across a set they can span 20 dB or more. That is not a small thing when
+the packs are meant to be compared: switching from EG Oreo to CherryMX Blue was
+mostly a jump in volume, which drowns out the difference in character you are
+actually trying to hear, and means the volume slider has to be re-set after every
+change.
 
 So each pack's `options.recommended_volume` is set from a measurement of its own
 'A' key, and `AudioEngine` applies it when the pack is loaded. Nothing is

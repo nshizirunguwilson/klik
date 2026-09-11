@@ -111,6 +111,12 @@ enum SelfTest {
             engine.play(virtualKey: key, isDown: true)
             samples.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1000)
         }
+        // Six hundred keystrokes in a fraction of a millisecond fills every
+        // voice. They are silent, but they are still running, and measuring the
+        // output while they drain would measure the timing loop rather than a
+        // keystroke. Wait out the longest sample in the set.
+        Thread.sleep(forTimeInterval: 0.7)
+
         samples.sort()
         let mean = samples.reduce(0, +) / Double(samples.count)
         print(String(format: "\nper-keystroke dispatch cost over %d calls:", samples.count))

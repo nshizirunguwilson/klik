@@ -97,6 +97,11 @@ final class KeyTap {
             if let source { CFRunLoopRemoveSource(runLoop, source, .commonModes) }
             CFRunLoopStop(runLoop)
         }
+        // Invalidated rather than just dropped. Releasing the last reference to
+        // a live Mach port leaves it able to fire into an object that is halfway
+        // through being taken apart, which is the shape of a crash that only
+        // ever happens on wake.
+        if let tap { CFMachPortInvalidate(tap) }
         tap = nil
         source = nil
         runLoop = nil

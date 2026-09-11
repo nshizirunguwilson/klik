@@ -54,7 +54,12 @@ struct MenuView: View {
             state.refreshLatency()
             state.setMonitoring(true)
         }
-        .onDisappear { state.setMonitoring(false) }
+        .onDisappear {
+            state.setMonitoring(false)
+            // Closing the menu is the natural moment to commit whatever was just
+            // changed in it, rather than waiting on a timer.
+            state.flushSettings()
+        }
     }
 
     /// Greeting typed at launch. The text field is here rather than hidden in a
@@ -153,9 +158,12 @@ struct MenuView: View {
                 .controlSize(.small)
                 .help("Hear this pack")
             }
-            Text("Picking a pack plays it straight away.")
+            Text(state.selectedPack?.summary ?? "Picking a pack plays it straight away.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

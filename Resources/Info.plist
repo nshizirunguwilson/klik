@@ -30,5 +30,13 @@
 	<string>NSApplication</string>
 	<key>LSUIElement</key>
 	<true/>
+	<!-- Klik is a background listener with no windows, which is exactly the
+	     shape of app macOS is happiest to terminate on its own when it looks
+	     idle. It did: the app would simply be gone, with no crash report and
+	     nothing on screen. Both of these are opt-in, and Klik opts out. -->
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
 </dict>
 </plist>

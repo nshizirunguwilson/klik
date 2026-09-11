@@ -196,14 +196,15 @@ Otherwise it is.
 
 ---
 
-## 5. The three tests
+## 5. The four tests
 
-All three run from the command line and none of them need the menu.
+All four run from the command line and none of them need the menu.
 
 ```sh
 /Applications/Klik.app/Contents/MacOS/Klik --demo        # audible
 /Applications/Klik.app/Contents/MacOS/Klik --selftest    # silent
 /Applications/Klik.app/Contents/MacOS/Klik --devicetest  # audible
+/Applications/Klik.app/Contents/MacOS/Klik --settings    # silent, instant
 ```
 
 ### `--demo`
@@ -221,6 +222,15 @@ the per keystroke path over 600 calls.
 Ends in `OK` or `FAIL`. Two checks in it matter most. Peak amplitude catches a
 pack that loads perfectly but decodes to silence. The mixer measurement proves
 the graph is genuinely producing audio.
+
+### `--settings`
+
+Prints what the next launch will restore, read straight out of the preferences
+store rather than from anything the running app believes. This is the one to
+reach for when a setting does not seem to be sticking: if it is right here, the
+app is saving it correctly and the problem is elsewhere.
+
+It is safe to run while Klik is running, and it exits immediately.
 
 ### `--devicetest`
 
@@ -290,6 +300,9 @@ Other symptoms:
 | A pack fails to load | It is probably still Ogg. Run `tools/prepare_pack.sh` on it. |
 | Permission lost after a rebuild | Check the signing authority in section 3. If it fell back to adhoc, the certificate is missing. |
 | App is completely silent, no obvious reason | Run `--selftest` first, then `--devicetest`. Between them they cover packs, decoding, the graph and device switching. |
+| Klik is gone and nobody quit it | Should not happen any more: the app now refuses automatic and sudden termination, and the audio exception that used to abort it is gone. To confirm, `log show --last 1d --predicate 'subsystem == "com.klik.Klik"'` and look for `Automatic and sudden termination disabled` at launch, and for any `Uncaught exception` line. |
+| A setting reverts after a restart | Run `--settings`. It prints what is actually stored. A change made in the menu is written immediately for the sound pack, and within half a second for everything else. |
+| Not sure which pack is which | The line under the picker says what each one is. EG Oreo is the quiet one, CherryMX Black PBT the middle one, CherryMX Blue ABS the loud clicky one. |
 
 ---
 

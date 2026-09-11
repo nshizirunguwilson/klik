@@ -19,11 +19,20 @@ final class AppState: ObservableObject {
 
     // MARK: Settings
 
+    /// Each of these mirrors one field of `Settings`. Changing one writes the
+    /// whole snapshot back out through `persist()`, so no setting can be saved
+    /// by one code path and forgotten by another.
+    ///
+    /// `restoring` is what makes that safe during launch: the properties are
+    /// filled in from disk before anything is wired up, and writing what we just
+    /// read would be pointless at best.
+    private var restoring = false
+
     @Published var isEnabled = true {
-        didSet { defaults.set(isEnabled, forKey: Keys.enabled); syncTapOptions() }
+        didSet { persist(); syncTapOptions() }
     }
     @Published var volume: Float = 0.8 {
-        didSet { defaults.set(volume, forKey: Keys.volume); applyVolume() }
+        didSet { persist(); applyVolume() }
     }
 
     /// Drop to silence whenever anything is plugged in or paired -- AirPods,
@@ -32,32 +41,30 @@ final class AppState: ObservableObject {
     /// If you are listening through headphones, clicks coming out of the laptop
     /// speakers are just noise for the room, not feedback for you.
     @Published var silenceWithExternalAudio = true {
-        didSet {
-            defaults.set(silenceWithExternalAudio, forKey: Keys.silenceExternal)
-            applyVolume()
-        }
+        didSet { persist(); applyVolume() }
     }
     /// Go quiet while a microphone is live: calls, recordings, dictation.
     @Published var silenceWhenMicActive = true {
-        didSet {
-            defaults.set(silenceWhenMicActive, forKey: Keys.silenceMic)
-            applyVolume()
-        }
+        didSet { persist(); applyVolume() }
     }
 
     @Published var pitchVariance: Float = 0.04 {
-        didSet { defaults.set(pitchVariance, forKey: Keys.pitch); audio.pitchVariance = pitchVariance }
+        didSet { persist(); audio.pitchVariance = pitchVariance }
     }
     @Published var playOnKeyUp = true {
-        didSet { defaults.set(playOnKeyUp, forKey: Keys.keyUp); syncTapOptions() }
+        didSet { persist(); syncTapOptions() }
     }
     @Published var ignoreRepeats = true {
-        didSet { defaults.set(ignoreRepeats, forKey: Keys.repeats); syncTapOptions() }
+        didSet { persist(); syncTapOptions() }
     }
     @Published var selectedPackID: String = "" {
         didSet {
             guard selectedPackID != oldValue else { return }
-            defaults.set(selectedPackID, forKey: Keys.pack)
+            // Written and flushed on the spot rather than left in the cache.
+            // This is the one setting whose loss is unmistakable, and it was
+            // being lost every time macOS terminated the app on its own.
+            persist(immediately: true)
+            guard !restoring else { return }
             // Switching is fast enough (about 10ms) to double as previewing:
             // pick a pack, hear it immediately, move on to the next.
             pendingDemo = !oldValue.isEmpty
@@ -70,7 +77,8 @@ final class AppState: ObservableObject {
     @Published var lowLatencyBuffer = true {
         didSet {
             guard lowLatencyBuffer != oldValue else { return }
-            defaults.set(lowLatencyBuffer, forKey: Keys.lowLatency)
+            persist()
+            guard !restoring else { return }
             audio.setLowLatency(lowLatencyBuffer)
             refreshLatency()
         }
@@ -82,7 +90,8 @@ final class AppState: ObservableObject {
     @Published var builtInOutput = true {
         didSet {
             guard builtInOutput != oldValue else { return }
-            defaults.set(builtInOutput, forKey: Keys.builtInOutput)
+            persist()
+            guard !restoring else { return }
             audio.setBuiltInOutput(builtInOutput)
             refreshLatency()
         }
@@ -92,15 +101,15 @@ final class AppState: ObservableObject {
     /// well as decorative: at login it confirms, out loud, that the app came up
     /// and the listener is armed before you have touched anything.
     @Published var welcomeEnabled = true {
-        didSet { defaults.set(welcomeEnabled, forKey: Keys.welcome) }
+        didSet { persist() }
     }
     @Published var welcomeText = "wilson" {
-        didSet { defaults.set(welcomeText, forKey: Keys.welcomeText) }
+        didSet { persist() }
     }
 
     @Published var launchAtLogin = false {
         didSet {
-            guard launchAtLogin != oldValue else { return }
+            guard launchAtLogin != oldValue, !restoring else { return }
             do {
                 try LoginItem.set(launchAtLogin)
                 // Registering is not the same as being switched on: macOS can
@@ -169,27 +178,12 @@ final class AppState: ObservableObject {
     private let keyTap = KeyTap()
     private let muteHotKey = GlobalHotKey()
     private let tapOptions = OSAllocatedUnfairLock(initialState: TapOptions())
-    private let defaults = UserDefaults.standard
     private let log = Logger(subsystem: "com.klik.Klik", category: "app")
     private var permissionTimer: Timer?
     private var watchdogTimer: Timer?
+    private var flushTimer: Timer?
     private var pendingWelcome = false
     private var pendingDemo = false
-
-    private enum Keys {
-        static let enabled = "isEnabled"
-        static let volume = "volume"
-        static let pitch = "pitchVariance"
-        static let keyUp = "playOnKeyUp"
-        static let repeats = "ignoreRepeats"
-        static let pack = "selectedPackID"
-        static let lowLatency = "lowLatencyBuffer"
-        static let builtInOutput = "builtInOutput"
-        static let welcome = "welcomeEnabled"
-        static let welcomeText = "welcomeText"
-        static let silenceExternal = "silenceWithExternalAudio"
-        static let silenceMic = "silenceWhenMicActive"
-    }
 
     init() {
         restoreSettings()
@@ -198,12 +192,23 @@ final class AppState: ObservableObject {
         if packs.isEmpty {
             status = "No sound packs found."
         } else if !packs.contains(where: { $0.id == selectedPackID }) {
+            // The saved pack is gone, or nothing has ever been saved. Whichever
+            // it is, the replacement has to be written down -- otherwise this
+            // same fallback runs again at every launch and the choice the user
+            // makes afterwards has nothing to overwrite.
+            log.notice("Saved pack \(self.selectedPackID, privacy: .public) not found, falling back")
+            // Still restoring: the single `loadSelectedPack()` below does the
+            // loading, and a fallback is not a choice the user just made, so it
+            // should not play the preview burst that picking a pack does. The
+            // write is covered by the `persist` at the end of init.
+            restoring = true
             selectedPackID = packs[0].id
+            restoring = false
         }
 
         audio.pitchVariance = pitchVariance
         audio.onOutputProblem = { [weak self] problem in
-            MainActor.assumeIsolated { self?.audioProblem = problem }
+            Task { @MainActor in self?.audioProblem = problem }
         }
         audio.start(lowLatencyBuffer: lowLatencyBuffer, builtInOutput: builtInOutput)
 
@@ -215,7 +220,9 @@ final class AppState: ObservableObject {
         pendingWelcome = welcomeEnabled
         loadSelectedPack()
 
+        restoring = true
         launchAtLogin = LoginItem.isEnabled
+        restoring = false
         if LoginItem.needsApproval { status = LoginItem.explanation }
 
         isTrusted = Accessibility.isTrusted
@@ -224,6 +231,11 @@ final class AppState: ObservableObject {
         } else {
             watchForPermission()
         }
+
+        // Whatever the launch settled on -- the restored pack, or the fallback --
+        // reaches disk before the first keystroke, rather than whenever the app
+        // next happens to be asked to save something.
+        persist(immediately: true)
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
@@ -234,19 +246,77 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: Saved settings
+
+    /// Fills every published property from disk without setting any of the
+    /// machinery in motion. Nothing is wired up yet at this point, and the
+    /// `didSet` side effects would be either useless or actively wrong.
     private func restoreSettings() {
-        if defaults.object(forKey: Keys.enabled) != nil { isEnabled = defaults.bool(forKey: Keys.enabled) }
-        if defaults.object(forKey: Keys.volume) != nil { volume = defaults.float(forKey: Keys.volume) }
-        if defaults.object(forKey: Keys.pitch) != nil { pitchVariance = defaults.float(forKey: Keys.pitch) }
-        if defaults.object(forKey: Keys.keyUp) != nil { playOnKeyUp = defaults.bool(forKey: Keys.keyUp) }
-        if defaults.object(forKey: Keys.repeats) != nil { ignoreRepeats = defaults.bool(forKey: Keys.repeats) }
-        if defaults.object(forKey: Keys.lowLatency) != nil { lowLatencyBuffer = defaults.bool(forKey: Keys.lowLatency) }
-        if defaults.object(forKey: Keys.builtInOutput) != nil { builtInOutput = defaults.bool(forKey: Keys.builtInOutput) }
-        if defaults.object(forKey: Keys.welcome) != nil { welcomeEnabled = defaults.bool(forKey: Keys.welcome) }
-        if defaults.object(forKey: Keys.silenceExternal) != nil { silenceWithExternalAudio = defaults.bool(forKey: Keys.silenceExternal) }
-        if let saved = defaults.string(forKey: Keys.welcomeText) { welcomeText = saved }
-        selectedPackID = defaults.string(forKey: Keys.pack) ?? ""
+        let saved = Settings.load()
+        restoring = true
+        isEnabled = saved.isEnabled
+        volume = saved.volume
+        pitchVariance = saved.pitchVariance
+        playOnKeyUp = saved.playOnKeyUp
+        ignoreRepeats = saved.ignoreRepeats
+        lowLatencyBuffer = saved.lowLatencyBuffer
+        builtInOutput = saved.builtInOutput
+        welcomeEnabled = saved.welcomeEnabled
+        welcomeText = saved.welcomeText
+        silenceWithExternalAudio = saved.silenceWithExternalAudio
+        silenceWhenMicActive = saved.silenceWhenMicActive
+        selectedPackID = saved.selectedPackID
+        restoring = false
         syncTapOptions()
+    }
+
+    /// The current state of every setting, ready to be written.
+    private var currentSettings: Settings {
+        Settings(
+            isEnabled: isEnabled,
+            volume: volume,
+            pitchVariance: pitchVariance,
+            playOnKeyUp: playOnKeyUp,
+            ignoreRepeats: ignoreRepeats,
+            selectedPackID: selectedPackID,
+            lowLatencyBuffer: lowLatencyBuffer,
+            builtInOutput: builtInOutput,
+            welcomeEnabled: welcomeEnabled,
+            welcomeText: welcomeText,
+            silenceWithExternalAudio: silenceWithExternalAudio,
+            silenceWhenMicActive: silenceWhenMicActive
+        )
+    }
+
+    /// Saves everything, every time anything changes.
+    ///
+    /// The write itself goes into an in-process cache and costs nothing, so
+    /// there is no reason to be clever about which setting moved. Pushing that
+    /// cache out to the preferences daemon does cost something, and a slider
+    /// being dragged would ask for it a hundred times a second, so that part is
+    /// either coalesced into a moment's quiet or -- for a change worth never
+    /// losing -- done on the spot.
+    private func persist(immediately: Bool = false) {
+        guard !restoring else { return }
+        currentSettings.save()
+
+        flushTimer?.invalidate()
+        flushTimer = nil
+        if immediately {
+            Settings.flush()
+            return
+        }
+        flushTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { _ in
+            Settings.flush()
+        }
+    }
+
+    /// Called when the menu closes, and on the way out. Anything still sitting
+    /// in the cache goes to disk now.
+    func flushSettings() {
+        flushTimer?.invalidate()
+        flushTimer = nil
+        Settings.flush()
     }
 
     private func syncTapOptions() {
@@ -364,8 +434,11 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Puts the output device's buffer size back before the app goes away.
+    /// Puts the output device's buffer size back before the app goes away, and
+    /// makes sure nothing the user changed in the last half second is still
+    /// sitting in a cache that dies with the process.
     func shutdown() {
+        flushSettings()
         audio.shutdown()
     }
 

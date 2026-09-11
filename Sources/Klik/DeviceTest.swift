@@ -60,9 +60,14 @@ enum DeviceTest {
         var failures: [String] = []
 
         func check(_ label: String) {
+            // Sampled while the keys are still sounding. Reading it afterwards
+            // would always say zero, which is what a finished sound looks like
+            // and not what this is asking about.
+            var busiest = 0
             let peak = engine.measureOutputPeak(seconds: 0.6) {
                 for key in [0 as UInt16, 1, 2, 49] {
                     engine.play(virtualKey: key, isDown: true)
+                    busiest = max(busiest, engine.playingVoiceCount)
                     Thread.sleep(forTimeInterval: 0.05)
                 }
             }
@@ -73,7 +78,7 @@ enum DeviceTest {
                          engine.isSettled ? "y" : "n",
                          engine.isUsingBuiltInOutput ? "y" : "n",
                          engine.currentOutputDeviceName))
-            print("        voices playing: \(engine.playingVoiceCount)/24")
+            print("        voices sounding at once: \(busiest)")
             if !ok { failures.append(label) }
         }
 

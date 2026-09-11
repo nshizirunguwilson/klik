@@ -21,10 +21,55 @@ private final class LoadedBuffers: @unchecked Sendable {
     }
 }
 
+/// One sounding keystroke.
+///
+/// Deliberately made of nothing but numbers and raw pointers. The render
+/// callback walks this on the audio thread, where retaining an object or
+/// touching a dictionary would be a dropped buffer waiting to happen. The
+/// samples it points at belong to the `LoadedBuffers` held in `PlaybackState`,
+/// and every voice is cleared before that object is ever let go.
+private struct Voice {
+    var left: UnsafePointer<Float>?
+    var right: UnsafePointer<Float>?
+    var frames: Int = 0
+    var position: Double = 0
+    var rate: Double = 1
+    var gain: Float = 0
+    var active: Bool = false
+    /// Play order, so the oldest voice is the one stolen when all are busy.
+    var sequence: UInt64 = 0
+}
+
 private struct PlaybackState: @unchecked Sendable {
     var buffers: LoadedBuffers?
     var volume: Float = 0.8
     var pitchVariance: Float = 0.04
+    var voices: [Voice]
+    var sequence: UInt64 = 0
+    /// Mirror of the engine's running flag, kept here so the key tap can read it
+    /// without racing the main thread.
+    var engineRunning = false
+}
+
+/// Where the limiter starts working. Packs are levelled so that a single
+/// keystroke never reaches this, which means one key at a time is passed through
+/// untouched and only genuine overlap is ever shaped.
+private let limiterKnee: Float = 0.7
+
+/// Saturates instead of clipping. Overlapping keystrokes add up, and a hard clip
+/// on a click turns it into a crunch.
+///
+/// Linear below the knee, then a smooth curve that approaches 1 and never
+/// exceeds it. The curve is the usual rational stand-in for `tanh` -- this runs
+/// on the audio thread for every sample, so it is arithmetic, not a call into
+/// libm.
+@inline(__always)
+private func softClip(_ x: Float) -> Float {
+    let magnitude = abs(x)
+    if magnitude <= limiterKnee { return x }
+    let over = min((magnitude - limiterKnee) / (1 - limiterKnee), 3)
+    let shaped = limiterKnee + (1 - limiterKnee) * (over * (27 + over * over) / (27 + 9 * over * over))
+    return x < 0 ? -shaped : shaped
 }
 
 /// The audio side of Klik.
@@ -34,34 +79,43 @@ private struct PlaybackState: @unchecked Sendable {
 ///
 ///  1. Every sample is decoded to PCM at load time and sliced into a ready-made
 ///     buffer per key. Nothing touches the disk or a decoder while typing.
-///  2. The node graph is built once and only rewired when the output device
-///     changes. Player nodes are started immediately and left running -- an idle
-///     player renders silence, so a keystroke costs one `scheduleBuffer` call
-///     and nothing else.
+///  2. There is exactly one node between the samples and the mixer: a source
+///     node whose render callback mixes a fixed set of voices by hand. A
+///     keystroke costs a lock, a dictionary lookup and a struct write.
 ///  3. The hardware buffer is shrunk as far as the output device allows, which
 ///     is the single biggest remaining term.
+///
+/// Point 2 replaced a bank of `AVAudioPlayerNode`s, and not for speed. Those
+/// nodes have to be told to `play()` again every time the graph is rebuilt,
+/// `play()` raises an Objective-C exception when the output device has not
+/// delivered its first render cycle yet, and an exception raised out of
+/// AVFoundation into Swift cannot be caught -- it takes the whole app with it.
+/// That is what was quitting Klik in the middle of the day, with no crash
+/// report and nothing on screen. Mixing the voices here means there is no
+/// `play()` to fail, and no audio node for the key tap and the main thread to
+/// fight over during a device change.
 final class AudioEngine {
 
     /// Everything is converted to this at load time so the graph can be built
     /// once with a fixed format regardless of what the packs contain.
     static let canonicalFormat = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
 
-    /// Enough voices that overlapping keystrokes never steal each other's node.
+    /// Enough voices that overlapping keystrokes never steal each other's slot.
     /// Typing tops out around 15 keys/second against samples of ~100ms.
-    private static let voiceCount = 24
+    private static let voiceCount = 32
 
     private let log = Logger(subsystem: "com.klik.Klik", category: "audio")
 
     private let engine = AVAudioEngine()
-    private var players: [AVAudioPlayerNode] = []
-    private var varispeeds: [AVAudioUnitVarispeed] = []
-    private var nextVoice = 0
+    private var source: AVAudioSourceNode?
 
-    private let state = OSAllocatedUnfairLock(initialState: PlaybackState())
+    private let state = OSAllocatedUnfairLock(
+        initialState: PlaybackState(voices: Array(repeating: Voice(), count: AudioEngine.voiceCount))
+    )
 
     /// Whether the engine is producing audio right now.
     private(set) var isRunning = false
-    /// Whether the voices have been attached. Separate from `isRunning` on
+    /// Whether the graph has been attached. Separate from `isRunning` on
     /// purpose: a failed restart leaves the graph built but not running, and
     /// recovery has to stay possible from there.
     private var hasBuiltGraph = false
@@ -101,14 +155,9 @@ final class AudioEngine {
         applyOutputDevice()
         applyIOBuffer()
 
-        for _ in 0..<Self.voiceCount {
-            let player = AVAudioPlayerNode()
-            let varispeed = AVAudioUnitVarispeed()
-            engine.attach(player)
-            engine.attach(varispeed)
-            players.append(player)
-            varispeeds.append(varispeed)
-        }
+        let node = makeSourceNode()
+        engine.attach(node)
+        source = node
         hasBuiltGraph = true
         connectGraph()
 
@@ -122,52 +171,148 @@ final class AudioEngine {
             self?.outputDevicesChanged()
         }
 
-        engine.prepare()
-        do {
-            try engine.start()
-            // Start every player once. From here a keystroke is a single
-            // scheduleBuffer with no state transition behind it.
-            players.forEach { $0.play() }
-            isRunning = true
-            report(problem: nil)
-            log.notice("Engine started, \(Self.voiceCount) voices, IO buffer \(self.ioBufferFrames) frames")
-        } catch {
-            report(problem: "Could not start sound output")
-            log.error("Engine failed to start: \(error.localizedDescription, privacy: .public)")
+        startEngine(reason: "launch")
+    }
+
+    /// Builds the one node that turns key presses into samples.
+    ///
+    /// The block runs on the audio thread, so it allocates nothing, retains
+    /// nothing and never calls into Swift runtime machinery that might.
+    private func makeSourceNode() -> AVAudioSourceNode {
+        AVAudioSourceNode(format: Self.canonicalFormat) { [state] isSilence, _, frameCount, audioBufferList in
+            let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            guard let leftData = buffers.first?.mData else {
+                isSilence.pointee = true
+                return noErr
+            }
+            for buffer in buffers {
+                memset(buffer.mData, 0, Int(buffer.mDataByteSize))
+            }
+
+            let frames = Int(frameCount)
+            let outLeft = leftData.assumingMemoryBound(to: Float.self)
+            let outRight = buffers.count > 1
+                ? buffers[1].mData!.assumingMemoryBound(to: Float.self)
+                : outLeft
+
+            let sounded = state.withLock { playback -> Bool in
+                var mixed = false
+                let master = playback.volume
+
+                for index in playback.voices.indices where playback.voices[index].active {
+                    var voice = playback.voices[index]
+                    guard let left = voice.left, voice.frames > 1 else {
+                        playback.voices[index].active = false
+                        continue
+                    }
+
+                    // Muted is not paused. A voice still has to run out in real
+                    // time while the volume is at zero, or every keystroke typed
+                    // on headphones sits there waiting, and unplugging fires all
+                    // thirty-two of them at once.
+                    if master <= 0 {
+                        voice.position += Double(frames) * voice.rate
+                        voice.active = voice.position < Double(voice.frames - 1)
+                        playback.voices[index] = voice
+                        continue
+                    }
+
+                    let right = voice.right ?? left
+                    let gain = voice.gain * master
+                    let last = Double(voice.frames - 1)
+                    var position = voice.position
+                    var frame = 0
+
+                    while frame < frames && position < last {
+                        let whole = Int(position)
+                        let fraction = Float(position - Double(whole))
+                        outLeft[frame] += (left[whole] + (left[whole + 1] - left[whole]) * fraction) * gain
+                        outRight[frame] += (right[whole] + (right[whole + 1] - right[whole]) * fraction) * gain
+                        position += voice.rate
+                        frame += 1
+                    }
+
+                    voice.position = position
+                    voice.active = position < last
+                    playback.voices[index] = voice
+                    mixed = true
+                }
+                return mixed
+            }
+
+            if sounded {
+                for frame in 0..<frames {
+                    outLeft[frame] = softClip(outLeft[frame])
+                }
+                if outRight != outLeft {
+                    for frame in 0..<frames {
+                        outRight[frame] = softClip(outRight[frame])
+                    }
+                }
+            }
+            isSilence.pointee = ObjCBool(!sounded)
+            return noErr
         }
     }
 
-    /// Wires the voices into the mixer and the mixer into the output device.
+    /// Wires the source node into the mixer and the mixer into the output device.
     ///
     /// This has to be redone after every output device change, and that is the
-    /// whole reason the bug existed. Changing the device gives the output node a
-    /// new format, but the mixer is still connected to it through a connection
-    /// shaped for the device that just left. Nothing complains. The engine keeps
-    /// saying it is running, every voice keeps saying it is connected and
-    /// playing, and the mixer renders pure silence into the stale connection.
+    /// whole reason the silence bug existed. Changing the device gives the
+    /// output node a new format, but the mixer is still connected to it through
+    /// a connection shaped for the device that just left. Nothing complains. The
+    /// engine keeps saying it is running and the mixer renders pure silence into
+    /// the stale connection.
     ///
     /// Reconnecting is what makes the engine notice the new device at all.
     private func connectGraph() {
+        guard let source else { return }
         // The mixer talks to the hardware in the hardware's own format and
-        // converts for us. The voices stay on the canonical format, which is
-        // what every pack was decoded into.
+        // converts for us. The source node stays on the canonical format, which
+        // is what every pack was decoded into.
         let hardware = engine.outputNode.outputFormat(forBus: 0)
         let outputFormat = hardware.sampleRate > 0 && hardware.channelCount > 0
             ? hardware
             : Self.canonicalFormat
         engine.connect(engine.mainMixerNode, to: engine.outputNode, format: outputFormat)
+        engine.connect(source, to: engine.mainMixerNode, format: Self.canonicalFormat)
+    }
 
-        for index in players.indices {
-            engine.connect(players[index], to: varispeeds[index], format: Self.canonicalFormat)
-            engine.connect(varispeeds[index], to: engine.mainMixerNode, format: Self.canonicalFormat)
+    /// Brings the graph up and records whether it worked. The only place the
+    /// engine is ever started, so there is one story about what a failure means.
+    @discardableResult
+    private func startEngine(reason: String) -> Bool {
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            setRunning(false)
+            log.error("Engine failed to start (\(reason, privacy: .public)): \(error.localizedDescription, privacy: .public)")
+            return false
         }
+        setRunning(true)
+        readBackIOBuffer()
+        failedRestarts = 0
+        report(problem: nil)
+        log.notice("Engine running (\(reason, privacy: .public)), built-in: \(self.isUsingBuiltInOutput), IO buffer \(self.ioBufferFrames) frames")
+        return true
+    }
+
+    private func setRunning(_ running: Bool) {
+        isRunning = running
+        state.withLock { $0.engineRunning = running }
     }
 
     /// The engine stops itself when the output device changes -- headphones in,
     /// AirPods connecting, a display unplugged. Restarting also re-pins the
     /// built-in speakers, which is exactly the moment that matters.
+    ///
+    /// This notification arrives on whatever thread CoreAudio felt like using,
+    /// so it hops to the main thread before touching any of the restart state.
     @objc private func handleConfigurationChange() {
-        scheduleRestart(reason: "output device changed")
+        DispatchQueue.main.async { [weak self] in
+            self?.scheduleRestart(reason: "output device changed")
+        }
     }
 
     /// Called whenever an audio device appears, disappears, or becomes the
@@ -176,8 +321,8 @@ final class AudioEngine {
     /// The engine does not raise a configuration change for a plain switch of
     /// the default output device, and pinning to the built-in speakers does not
     /// stop macOS from idling that device once everything else has moved to
-    /// headphones. In both cases the engine goes on reporting itself as running,
-    /// with every voice connected and playing, and renders nothing at all.
+    /// headphones. In both cases the engine goes on reporting itself as running
+    /// and renders nothing at all.
     ///
     /// There is no reliable flag for that state, so any device change is treated
     /// as a reason to rebuild. A restart is a few milliseconds and is silent.
@@ -210,6 +355,10 @@ final class AudioEngine {
     /// key is sounding cuts it off. Waiting for the changes to stop means one
     /// restart per real event.
     private func scheduleRestart(reason: String, after delay: TimeInterval? = nil) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.scheduleRestart(reason: reason, after: delay) }
+            return
+        }
         pendingRestart?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.hasBuiltGraph else { return }
@@ -225,33 +374,26 @@ final class AudioEngine {
 
     private func restart(reason: String) {
         engine.stop()
+        setRunning(false)
         applyOutputDevice()
         applyIOBuffer()
         connectGraph()
-        do {
-            engine.prepare()
-            try engine.start()
-            players.forEach { $0.play() }
-            isRunning = true
-            failedRestarts = 0
-            report(problem: nil)
-            log.notice("Restarted (\(reason, privacy: .public)), built-in: \(self.isUsingBuiltInOutput), IO buffer \(self.ioBufferFrames) frames")
-        } catch {
-            isRunning = false
-            failedRestarts += 1
-            // A device that is still settling refuses to start, and a moment
-            // later it is ready. Backing off rather than giving up is the
-            // difference between sound returning on its own and never.
-            let wait = min(8, 0.25 * pow(2, Double(failedRestarts - 1)))
-            log.error("Restart failed (attempt \(self.failedRestarts)): \(error.localizedDescription, privacy: .public), retrying in \(wait)s")
-            // Say nothing about the first stumble. Devices routinely refuse the
-            // first attempt and are ready by the second, and a warning that
-            // appears and vanishes is worse than none.
-            if failedRestarts > 1 {
-                report(problem: "Sound output is not responding, keeping trying")
-            }
-            scheduleRestart(reason: "retry after a failed restart", after: wait)
+
+        if startEngine(reason: reason) { return }
+
+        failedRestarts += 1
+        // A device that is still settling refuses to start, and a moment later
+        // it is ready. Backing off rather than giving up is the difference
+        // between sound returning on its own and never.
+        let wait = min(8, 0.25 * pow(2, Double(failedRestarts - 1)))
+        log.error("Restart failed (attempt \(self.failedRestarts)), retrying in \(wait)s")
+        // Say nothing about the first stumble. Devices routinely refuse the
+        // first attempt and are ready by the second, and a warning that appears
+        // and vanishes is worse than none.
+        if failedRestarts > 1 {
+            report(problem: "Sound output is not responding, keeping trying")
         }
+        scheduleRestart(reason: "retry after a failed restart", after: wait)
     }
 
     /// Points the engine's output at the laptop speakers, or back at whatever
@@ -323,12 +465,14 @@ final class AudioEngine {
         guard hasBuiltGraph else { return }
         pendingRestart?.cancel()
         pendingRestart = nil
-        players.forEach { $0.stop() }
+        state.withLock { playback in
+            for index in playback.voices.indices { playback.voices[index] = Voice() }
+        }
         engine.stop()
         for (device, frames) in originalIOBufferFrames {
             setIOBuffer(frames: frames, on: device)
         }
-        isRunning = false
+        setRunning(false)
     }
 
     // MARK: - Settings
@@ -349,25 +493,47 @@ final class AudioEngine {
     /// Returns whether a sound was actually found for the key.
     @discardableResult
     func play(virtualKey: UInt16, isDown: Bool) -> Bool {
-        let snapshot = state.withLock { $0 }
-        guard let buffers = snapshot.buffers else { return false }
-        let table = isDown ? buffers.down : buffers.up
-        let generic = isDown ? buffers.genericDown : buffers.genericUp
-        guard let buffer = table[virtualKey] ?? generic else { return false }
+        state.withLock { playback -> Bool in
+            guard playback.engineRunning, let buffers = playback.buffers else { return false }
+            let table = isDown ? buffers.down : buffers.up
+            let generic = isDown ? buffers.genericDown : buffers.genericUp
+            guard let buffer = table[virtualKey] ?? generic,
+                  let channels = buffer.floatChannelData,
+                  buffer.frameLength > 1 else { return false }
 
-        let voice = nextVoice
-        nextVoice = (nextVoice + 1) % players.count
+            var slot = -1
+            for index in playback.voices.indices where !playback.voices[index].active {
+                slot = index
+                break
+            }
+            if slot < 0 {
+                // Everything is busy, so the oldest sound is the one to cut off.
+                var oldest = playback.voices[0].sequence
+                slot = 0
+                for index in playback.voices.indices where playback.voices[index].sequence < oldest {
+                    oldest = playback.voices[index].sequence
+                    slot = index
+                }
+            }
 
-        // Per-keystroke pitch and gain jitter. Without this a dozen samples
-        // played back identically read as a loop rather than as a keyboard.
-        let variance = snapshot.pitchVariance
-        varispeeds[voice].rate = variance > 0
-            ? 1.0 + Float.random(in: -variance...variance)
-            : 1.0
-        players[voice].volume = snapshot.volume * Float.random(in: 0.85...1.0)
+            // Per-keystroke pitch and gain jitter. Without this a dozen samples
+            // played back identically read as a loop rather than as a keyboard.
+            let variance = playback.pitchVariance
+            let rate = variance > 0 ? 1.0 + Double(Float.random(in: -variance...variance)) : 1.0
 
-        players[voice].scheduleBuffer(buffer, at: nil, options: [.interrupts], completionHandler: nil)
-        return true
+            playback.sequence &+= 1
+            playback.voices[slot] = Voice(
+                left: UnsafePointer(channels[0]),
+                right: UnsafePointer(channels[buffer.format.channelCount > 1 ? 1 : 0]),
+                frames: Int(buffer.frameLength),
+                position: 0,
+                rate: rate,
+                gain: Float.random(in: 0.85...1.0),
+                active: true,
+                sequence: playback.sequence
+            )
+            return true
+        }
     }
 
     // MARK: - Loading
@@ -400,11 +566,28 @@ final class AudioEngine {
 
         guard !down.isEmpty || !up.isEmpty else { throw SoundPackError.noDefinitions }
 
-        let filledDown = fillGaps(in: down)
-        let filledUp = fillGaps(in: up)
+        // Packs arrive at wildly different levels -- the quietest recording in
+        // the set is about 24 dB below the loudest. Applied here, once, while
+        // every buffer is still its own object: `fillGaps` hands the same buffer
+        // to several keys, so scaling afterwards would scale some of them twice.
+        if pack.recommendedVolume != 1 {
+            for buffer in down.values { scale(buffer, by: pack.recommendedVolume) }
+            for buffer in up.values { scale(buffer, by: pack.recommendedVolume) }
+        }
 
-        let loaded = LoadedBuffers(down: filledDown, up: filledUp)
-        state.withLock { $0.buffers = loaded }
+        let loaded = LoadedBuffers(down: fillGaps(in: down), up: fillGaps(in: up))
+
+        // Silence every voice before the samples it points at can go away, then
+        // let the old pack go outside the lock so the audio thread is never
+        // waiting on a few hundred deallocations.
+        let retired = state.withLock { playback -> LoadedBuffers? in
+            for index in playback.voices.indices { playback.voices[index] = Voice() }
+            let previous = playback.buffers
+            playback.buffers = loaded
+            return previous
+        }
+        withExtendedLifetime(retired) {}
+
         log.notice("Loaded \(pack.name, privacy: .public): \(down.count) down, \(up.count) up")
     }
 
@@ -504,6 +687,19 @@ final class AudioEngine {
         return out
     }
 
+    /// Brings one pack up or down to the level of the rest of them, so that
+    /// choosing between packs is a choice about how they sound rather than how
+    /// loud they are. `tools/level_packs.py` works out the number.
+    private func scale(_ buffer: AVAudioPCMBuffer, by factor: Float) {
+        guard let data = buffer.floatChannelData else { return }
+        for channel in 0..<Int(buffer.format.channelCount) {
+            let samples = data[channel]
+            for frame in 0..<Int(buffer.frameLength) {
+                samples[frame] *= factor
+            }
+        }
+    }
+
     /// Slice boundaries land wherever the pack author put them, often mid-waveform.
     /// A hard cut there is an audible click on top of the intended click.
     private func applyFades(to buffer: AVAudioPCMBuffer) {
@@ -552,10 +748,6 @@ final class AudioEngine {
     /// the headphone jack. The jack shares the built-in device, so when
     /// earphones are in it that device routes to the earphones and pinning to it
     /// would not keep the sound in the room the way the setting promises.
-    ///
-    /// The engine used to look this up itself and check only the transport, so
-    /// it happily pinned to the built-in device with earphones plugged into it,
-    /// while the menu said the sound was going to the speakers.
     private var builtInOutputDevice: AudioDeviceID? {
         OutputDevices.builtInSpeakers
     }
@@ -660,8 +852,10 @@ final class AudioEngine {
         return value as String
     }
 
-    /// How many voices are started, for the device test.
-    var playingVoiceCount: Int { players.filter { $0.isPlaying }.count }
+    /// How many voices are sounding, for the device test.
+    var playingVoiceCount: Int {
+        state.withLock { $0.voices.reduce(0) { $0 + ($1.active ? 1 : 0) } }
+    }
 
     /// Frame count and peak amplitude of a loaded key, for the self-test.
     /// A slice that decodes but is silent means the offsets are wrong.

@@ -54,7 +54,11 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
         // were being lost.
         info.disableAutomaticTermination("Klik listens for keystrokes in the background")
         info.disableSuddenTermination()
-        Self.log.notice("Automatic and sudden termination disabled")
+        // Read back rather than assumed. `NSSupportsAutomaticTermination` in the
+        // Info.plist is the authoritative opt-out and this is where it shows up,
+        // so a build that lost the key, or a framework that turned it back on,
+        // says so in the log instead of being discovered months later.
+        Self.log.notice("Sudden termination disabled; automatic termination support: \(info.automaticTerminationSupportEnabled)")
     }
 
     /// Writes the exception and its stack to the unified log before the process

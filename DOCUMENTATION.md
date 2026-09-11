@@ -19,6 +19,7 @@ decision was made, and how to run, extend and troubleshoot it.
 10. [Every menu control](#10-every-menu-control)
 11. [The self test](#11-the-self-test)
 12. [Problems hit during development](#12-problems-hit-during-development)
+12b. [Staying alive and remembering settings](#12b-staying-alive-and-remembering-settings)
 13. [Measured performance](#13-measured-performance)
 14. [Troubleshooting](#14-troubleshooting)
 15. [Limitations and future work](#15-limitations-and-future-work)
@@ -87,15 +88,29 @@ takes about 10 milliseconds and happens once.
 **The risk:** attaching, connecting or reconfiguring audio nodes causes the audio
 engine to reconfigure itself, which stalls.
 
-**The solution:** the graph is built once at startup and never rewired. It is 24
-independent voices, each one a player node feeding a varispeed node feeding the
-main mixer. Every player is started immediately and left running forever. An idle
-player renders silence, which costs nothing, so playing a key requires no state
-change at all: just one call to schedule a buffer.
+**The solution:** the graph is one source node feeding the main mixer, and the
+source node's render callback mixes the voices itself. A voice is a raw pointer
+to the key's samples, a playback position, a rate and a gain -- 32 of them in a
+fixed array behind an unfair lock. Playing a key means filling one of those
+slots. Nothing is allocated, nothing is retained, and no audio node changes
+state.
 
 The single exception is when the output device changes, for example when you
 connect headphones. macOS stops the engine in that case, so Klik catches the
 notification and restarts.
+
+**Why not player nodes.** Klik used to run 24 `AVAudioPlayerNode`s, each feeding
+a varispeed node. That design works until the graph has to be rebuilt, which a
+device change forces. Every player then has to be told to `play()` again, and
+`AVAudioPlayerNode.play()` raises the Objective-C exception *"player did not see
+an IO cycle"* when the output device has not yet delivered a render cycle -- which
+is exactly the state a Bluetooth device is in while it settles. Swift has no way
+to catch an Objective-C exception, so the process aborts on the spot. The
+symptom was Klik vanishing during the day with no crash report and no message.
+
+Mixing the voices by hand removes the whole category: there is no `play()` to
+raise, and no audio node for the key tap thread and the main thread to fight
+over while the graph is being rewired underneath them.
 
 ### 2.3 Receiving the keystroke
 
@@ -123,10 +138,16 @@ Latency is not the only thing that breaks the illusion. A pack has around 96
 recordings. Played back identically every time, the ear detects the repetition
 within seconds and the effect collapses into an obvious loop.
 
-Klik randomises pitch and gain slightly on every keystroke. Pitch comes from the
-varispeed node, whose rate is set just before the buffer is scheduled. Gain is set
-on the player node. The amount is controlled by the Variation slider, and setting
-it to zero disables the effect entirely.
+Klik randomises pitch and gain slightly on every keystroke. Pitch is the rate at
+which the mixer walks through the sample, with linear interpolation between
+frames; gain is a multiplier on the voice. The amount is controlled by the
+Variation slider, and setting it to zero disables the effect entirely.
+
+A second thing that breaks it is loudness. Packs come from different places and
+measured across the set they spanned about 24 dB, so switching packs was mostly a
+change in volume, which drowns out the difference in character you are trying to
+hear. `tools/level_packs.py` measures each pack and writes a playback gain into
+its config; the engine applies it when the pack loads.
 
 ---
 
@@ -158,9 +179,15 @@ it to zero disables the effect entirely.
   +----------------------------------+
   |  AudioEngine.play                |
   |  look up buffer for this key     |
-  |  pick next voice, round robin    |
-  |  set varispeed rate, set volume  |
-  |  scheduleBuffer                  |
+  |  take a free voice, or the       |
+  |    oldest one if all are busy    |
+  |  set pointers, rate and gain     |
+  +----------------------------------+
+          |
+          v
+  +----------------------------------+
+  |  Source node render callback     |
+  |  sum every active voice, limit   |
   +----------------------------------+
           |
           v
@@ -173,9 +200,9 @@ it to zero disables the effect entirely.
        You hear it
 ```
 
-The whole path from tap callback to scheduled buffer takes a median of about 2
-microseconds. The remaining delay is the audio hardware itself, measured at 2.79
-milliseconds.
+The whole path from tap callback to an armed voice takes a median of about 0.2
+microseconds. The remaining delay is the audio hardware itself, measured at 4.1
+milliseconds with a 128 frame render quantum.
 
 ---
 
@@ -191,7 +218,9 @@ klik/
 
   Sources/Klik/
     KlikApp.swift                     entry point and MenuBarExtra scene
+    AppLifecycle.swift                keeps macOS from quitting the app
     AppState.swift                    settings, wiring, all the policy
+    Settings.swift                    what is saved, and when it is flushed
     MenuView.swift                    the menu bar interface
     AudioEngine.swift                 decoding, slicing, playback
     KeyTap.swift                      the global key listener
@@ -209,9 +238,11 @@ klik/
     Info.plist                        bundle metadata
     AppIcon.icns                      generated icon
 
-  SoundPacks/                         eight bundled packs
+  SoundPacks/                         sixteen bundled packs
   tools/
     prepare_pack.sh                   Ogg to WAV conversion
+    make_sound_packs.py               synthesises the eight designed packs
+    level_packs.py                    measures and levels every pack
     make_icon.swift                   draws the app icon
     create_signing_identity.sh        makes a self signed certificate
     export_signing_identity.sh        backs a certificate up
@@ -304,9 +335,16 @@ modifier pair. After loading, any key with no sound borrows one from the most
 physically similar key that does have one, so nothing on the keyboard is silent.
 A generic fallback catches anything with no sensible neighbour.
 
-**Playing.** Round robin across 24 voices. Each play sets the varispeed rate, sets
-the player volume, and schedules the buffer with the interrupt option so a reused
-voice cuts cleanly rather than queueing.
+**Playing.** A free slot out of 32, or the oldest one if every slot is busy. Each
+play records where the samples are, how fast to read them and how loud, and the
+render callback does the rest. A voice keeps advancing while the volume is at
+zero rather than being held: otherwise every keystroke typed on headphones would
+queue up and fire at once when they came out.
+
+**Limiting.** Overlapping voices are summed and then passed through a curve that
+is exactly linear below 0.7 and saturates smoothly towards 1. Packs are levelled
+so a single keystroke never reaches the knee, so one key at a time is never
+shaped and only real overlap is.
 
 **Device control.** The engine can pin its output to the built in speakers by
 setting the device ID on the output audio unit. This must happen while the engine
@@ -819,7 +857,7 @@ Four separate faults were behind it, each capable of causing it alone.
 a new format, but the mixer stays connected to it through a connection built for
 the device that left. That connection is never remade, so the mixer renders into
 a dead end. This was the main cause, and the hardest to see, because nothing
-reports an error: the engine says it is running, every one of the 24 voices says
+reports an error: the engine says it is running, every one of the voices says
 it is connected and playing, and the measured output is exactly zero. Solved by
 reconnecting the mixer and the voices after every device change.
 
@@ -852,6 +890,69 @@ into the earphones while the menu said it was going to the speakers.
 Section 11.1 describes the test written to catch all of this.
 
 ---
+
+
+## 12b. Staying alive and remembering settings
+
+Two complaints that turned out to be the same story told twice: Klik would be
+gone without anybody quitting it, and a chosen sound pack would not be there the
+next time it started.
+
+### The app quitting itself
+
+There were two ways it happened, and neither left anything on screen.
+
+**An uncatchable exception.** `AVAudioPlayerNode.play()` raises the Objective-C
+exception *"player did not see an IO cycle"* when the output device has not yet
+delivered a render cycle. The old engine called it on 24 nodes every time the
+graph was rebuilt, which a device change forces, and a Bluetooth device settling
+is exactly the moment the exception fires. Swift cannot catch it, so the process
+aborted. It is in the system log with a stack trace naming
+`AudioEngine.restart(reason:)`. Fixed by removing the player nodes entirely --
+see [section 2.2](#22-building-the-audio-graph).
+
+**macOS quitting it.** A `LSUIElement` app with no windows is a candidate for
+automatic termination: the system decides it is idle, quits it, and files no
+report because as far as it is concerned nothing went wrong. `Info.plist` now
+declares `NSSupportsAutomaticTermination` and `NSSupportsSuddenTermination` as
+false, and `AppLifecycle` holds `disableAutomaticTermination` and
+`disableSuddenTermination` assertions for the life of the process. Look for
+`Automatic and sudden termination disabled` in the log to confirm it took.
+
+`AppLifecycle` also installs an uncaught exception handler. It cannot stop a
+future exception from ending the process, but it writes the name, reason and
+stack to the log first, so "it just disappeared" becomes something readable:
+
+```sh
+log show --last 1d --predicate 'subsystem == "com.klik.Klik"'
+```
+
+### Settings not sticking
+
+`UserDefaults` writes land in an in-process cache and reach the preferences
+daemon a moment later. When macOS terminated Klik on its own, that cache went
+with it -- so a pack chosen minutes earlier was simply not on disk. Separately,
+`silenceWhenMicActive` was written but never read back, so "Silence during calls"
+reset to on at every launch no matter what it was set to.
+
+`Settings` replaces twelve independent `didSet` writes with one struct that is
+saved and restored whole. A field that exists is saved and restored; there is no
+third place to forget. Changing anything writes every field, and the flush to the
+daemon is coalesced into 0.4 seconds of quiet, forced immediately when the sound
+pack changes, and forced again when the menu closes and when the app quits.
+
+There is one more case the old code got wrong. When the saved pack is missing --
+a pack folder deleted, or a first ever launch -- the app falls back to the first
+pack it can find. That fallback was never written down, so the same guess was
+made at every launch. It is written now, which is what makes the next choice
+have something to overwrite.
+
+To see exactly what the next launch will restore:
+
+```sh
+/Applications/Klik.app/Contents/MacOS/Klik --settings
+```
+
 
 ## 13. Measured performance
 

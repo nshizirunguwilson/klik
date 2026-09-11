@@ -49,6 +49,7 @@ works inside.
 ## Checking it without granting permission
 
 ```sh
+./build/Klik.app/Contents/MacOS/Klik --settings    # what the next launch will restore
 ./build/Klik.app/Contents/MacOS/Klik --demo        # audible: types "klik"
 ./build/Klik.app/Contents/MacOS/Klik --selftest    # silent: packs, buffers, timings
 ./build/Klik.app/Contents/MacOS/Klik --devicetest  # audible: survives device changes
@@ -86,17 +87,39 @@ nothing for it.
 
 ## Sound packs
 
-Eight packs ship with the app, from the MechvibesDX collection:
+Sixteen packs ship with the app, in two families.
+
+**Designed packs**, built by `tools/make_sound_packs.py`. Each one is deliberately
+unlike every other, so picking between them is something you can do by ear:
+
+| Pack | Character | Centre | Length |
+|---|---|---|---|
+| Deep Thock | Low and muffled, nothing above 1.5 kHz | 165 Hz | 116 ms |
+| Water Drop | A pure tone sliding upward, no click at all | 653 Hz | 178 ms |
+| Wood Block | A hollow harmonic knock | 805 Hz | 105 ms |
+| Bubble Pop | Short, high, falling in pitch | 1.1 kHz | 52 ms |
+| Glass Bell | Inharmonic partials that ring on | 3.0 kHz | 441 ms |
+| Retro Blip | Stepped square waves, unapologetically 8-bit | 4.1 kHz | 79 ms |
+| Typewriter | Metallic strike over a heavy carriage thunk | 4.8 kHz | 137 ms |
+| Paper Tap | Dry filtered noise, no pitch whatsoever | 9.8 kHz | 29 ms |
+
+**Recorded packs**, from the MechvibesDX collection. These are faithful recordings of
+real switches, and several of them measure almost identically, which is the reason the
+designed family exists:
 
 | Pack | Character |
 |---|---|
-| CherryMX Blue (ABS) | Sharp click, the loudest and most recognisable |
-| CherryMX Black (ABS / PBT) | Linear, firm, no click |
+| CherryMX Blue (ABS) | Sharp click, the brightest of the recorded set |
+| CherryMX Black (ABS / PBT) | Linear and firm; the two are near-indistinguishable |
 | CherryMX Brown (PBT) | Tactile bump, muted middle ground |
-| CherryMX Red (ABS) | Light and quick, higher pitched |
-| Topre Purple Hybrid (PBT) | Soft rounded "thock", nothing like the Cherrys |
-| EG Oreo | Deep and creamy, low end |
-| EG Crystal Purple | Bright, glassy, high pitched |
+| CherryMX Red (ABS) | Light and quick |
+| Topre Purple Hybrid (PBT) | Soft rounded "thock" |
+| EG Oreo | The shortest recorded sample here |
+| EG Crystal Purple | Short and light |
+
+Every pack carries a one-line description, shown under the picker, and a playback gain
+measured by `tools/level_packs.py` so that switching packs changes the character rather
+than the volume.
 
 Drop more into:
 
@@ -130,12 +153,21 @@ The interesting constraint is latency. Past roughly 20 ms between keypress and s
 the brain stops accepting it as the keyboard's own noise. Three things follow:
 
 - **Nothing decodes while typing.** The whole sprite is decoded at load and sliced
-  into a ready buffer per key, per direction. A keystroke costs one `scheduleBuffer`.
-- **The graph is built once.** 24 voices of `player → varispeed → mixer`, wired at
-  startup and never rewired. Every player is started immediately and left running, so
-  a keystroke involves no state transition. An idle player just renders silence.
+  into a ready buffer per key, per direction. A keystroke costs a lock, a dictionary
+  lookup and a struct write.
+- **The graph is one node.** A single `AVAudioSourceNode` feeds the mixer, and its
+  render callback mixes 32 voices by hand: raw sample pointers, a playback position
+  and a rate, no allocation and no reference counting on the audio thread. Pitch
+  variation is a resampling rate rather than a separate node.
   The one exception is an output device change, which macOS handles by stopping the
   engine; Klik catches that and restarts.
+
+  This replaced a bank of `AVAudioPlayerNode`s, and the reason was not speed. Those
+  nodes must be told to `play()` again after every rebuild, and `play()` raises an
+  Objective-C exception when the output device has not delivered its first render
+  cycle yet. Swift cannot catch that, so the process aborts where it stands: Klik
+  disappearing mid-afternoon with no crash report and nothing on screen. Mixing the
+  voices here means there is no `play()` to fail.
 - **Key events come from a CoreGraphics event tap**, not the app framework. The tap is
   `.listenOnly`, so it sits outside the input path and a slow callback cannot stall
   typing system-wide. The callback reads a key code and hands it straight to the audio
@@ -161,22 +193,31 @@ shared with other apps, so it can be turned off in the menu.
 Per-keystroke pitch and gain randomisation is what stops ~96 samples from sounding
 like a loop. The **Variation** slider controls it; at zero, playback is flat.
 
-Measured on the development machine: 2.79 ms of output latency, and a median 1.8 µs
-(p99 85 µs) spent between the tap callback and the buffer being scheduled.
+Overlapping keystrokes are summed and then passed through a limiter that is linear
+below 0.7 and saturates smoothly above it. Packs are levelled by
+`tools/level_packs.py` so a single keystroke never reaches that knee, which means one
+key at a time is never shaped at all.
+
+Measured on the development machine: 4.12 ms of output latency, and a median 0.2 µs
+(p99 1.8 µs) spent between the tap callback and the voice being armed.
 
 ## Layout
 
 ```
 Sources/Klik/
-  KlikApp.swift      MenuBarExtra scene, CLI entry point
-  AppState.swift     settings, permission watch, wiring
-  MenuView.swift     the menu UI
-  AudioEngine.swift  decode, slice, node pool, playback
-  KeyTap.swift       CGEvent tap on its own run loop thread
-  KeyCodes.swift     macOS virtual key codes → pack key identifiers
-  SoundPack.swift    v1 and v2 config parsing
-  SelfTest.swift     --selftest / --demo
-  DeviceTest.swift   --devicetest
-SoundPacks/          bundled packs, copied into the app at build time
-tools/prepare_pack.sh
+  KlikApp.swift        MenuBarExtra scene, CLI entry point
+  AppLifecycle.swift   keeps macOS from quitting the app on its own
+  AppState.swift       settings, permission watch, wiring
+  Settings.swift       what is saved between launches, and when it is flushed
+  MenuView.swift       the menu UI
+  AudioEngine.swift    decode, slice, voice mixing, output device handling
+  KeyTap.swift         CGEvent tap on its own run loop thread
+  KeyCodes.swift       macOS virtual key codes → pack key identifiers
+  SoundPack.swift      v1 and v2 config parsing
+  SelfTest.swift       --selftest / --demo
+  DeviceTest.swift     --devicetest
+SoundPacks/            bundled packs, copied into the app at build time
+tools/prepare_pack.sh      convert a downloaded pack's .ogg to .wav
+tools/make_sound_packs.py  synthesise the eight designed packs
+tools/level_packs.py       measure each pack and set its playback gain
 ```

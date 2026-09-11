@@ -21,6 +21,9 @@ struct KeySound {
 struct SoundPack: Identifiable, Hashable {
     var id: String
     var name: String
+    /// One line on what this pack actually sounds like, shown under the picker.
+    /// A list of sixteen switch names tells you nothing about which one to pick.
+    var summary: String?
     var directory: URL
     /// The shared sprite. Nil for multi-file packs.
     var audioURL: URL?
@@ -90,7 +93,11 @@ enum SoundPackLoader {
                 }
             }
         }
+        // Sorted by name rather than by folder, so the menu reads the way the
+        // picker does and two packs that only differ by keycap material end up
+        // next to each other where the similarity is at least obvious.
         return order.compactMap { byID[$0] }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     static func load(from directory: URL) throws -> SoundPack {
@@ -102,6 +109,7 @@ enum SoundPackLoader {
 
         let id = (root["id"] as? String) ?? directory.lastPathComponent
         let name = (root["name"] as? String) ?? directory.lastPathComponent
+        let summary = (root["description"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let volume = (root["options"] as? [String: Any])?["recommended_volume"] as? Double
 
         let keys: [UInt16: KeySound]
@@ -130,6 +138,7 @@ enum SoundPackLoader {
         return SoundPack(
             id: id,
             name: name,
+            summary: (summary?.isEmpty == false) ? summary : nil,
             directory: directory,
             audioURL: audioURL,
             keys: keys,

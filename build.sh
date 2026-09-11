@@ -38,6 +38,14 @@ if [[ ! -f Resources/AppIcon.icns ]]; then
 fi
 cp Resources/AppIcon.icns "$CONTENTS/Resources/AppIcon.icns"
 
+# The synthesised packs are built from tools/make_sound_packs.py rather than
+# checked in, same as the converted .wav files. A fresh clone therefore has the
+# config.json but no audio, so build them before looking for what to copy.
+if ! compgen -G 'SoundPacks/klik-*/sound.wav' >/dev/null; then
+  echo "==> Generating sound packs"
+  python3 tools/make_sound_packs.py
+fi
+
 if [[ -d SoundPacks ]]; then
   mkdir -p "$CONTENTS/Resources/SoundPacks"
   MISSING_AUDIO=()
